@@ -159,7 +159,7 @@ func OAuth2AuthorizationGET(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter
 		session.Claims.Audience = append([]string{clientID}, oauthelia2.JoinGrantedAudienceAndResource(requester.GetGrantedAudience(), requester.GetGrantedResource())...)
 	}
 
-	handleOAuth2AuthorizationBackChannelLogout(ctx, provider, &userSession, client, session)
+	handleOAuth2AuthorizationBackChannelLogout(ctx, provider, client, session)
 
 	ctx.GetLogger().Tracef("Authorization Request with id '%s' on client with id '%s' using policy '%s' creating session for Authorization Response for subject '%s' with username '%s' with groups: %+v and claims: %+v",
 		requester.GetID(), session.ClientID, policy.Name, session.Subject, session.Username, userSession.Groups, session.Claims)

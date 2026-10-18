@@ -119,8 +119,17 @@ func writeOAuth2EndSessionError(rw http.ResponseWriter, err error) {
 // handleOAuth2AuthorizationBackChannelLogout gives the ID Token a 'sid' claim and records the client against the
 // user session, so the client can be sent a Logout Token when the session ends. Clients without a
 // 'backchannel_logout_uri' are left untouched: their ID Tokens carry no 'sid' and nothing is recorded.
-func handleOAuth2AuthorizationBackChannelLogout(ctx *middlewares.AutheliaCtx, provider *session.Session, userSession *session.UserSession, client oidc.Client, s *oidc.Session) {
+//
+// The session is reloaded rather than taken from the caller: earlier steps of the request (consent) may have saved a
+// newer copy, which saving the caller's copy would undo.
+func handleOAuth2AuthorizationBackChannelLogout(ctx *middlewares.AutheliaCtx, provider *session.Session, client oidc.Client, s *oidc.Session) {
 	if c, ok := client.(oauthelia2.BackChannelLogoutClient); !ok || c.GetBackChannelLogoutURI() == "" {
+		return
+	}
+
+	userSession, err := provider.GetSession(ctx.RequestCtx)
+	if err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Error occurred loading the user session to record the OpenID Connect 1.0 logout state for client with id '%s'", client.GetID())
 		return
 	}
 
@@ -142,7 +151,7 @@ func handleOAuth2AuthorizationBackChannelLogout(ctx *middlewares.AutheliaCtx, pr
 	}
 
 	// Not fatal: the user still gets their tokens, the client just won't hear about this session ending.
-	if err := provider.SaveSession(ctx.RequestCtx, *userSession); err != nil {
+	if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred saving the OpenID Connect 1.0 logout state for client with id '%s' to the user session", client.GetID())
 	}
 }
