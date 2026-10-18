@@ -7,6 +7,7 @@ package validator
 import (
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/utils"
@@ -24,6 +25,8 @@ const (
 		"an invalid value: post logout redirect uri '%s' must have a scheme but it's absent"
 	errFmtOIDCClientPostLogoutRedirectURIFragment = errFmtOIDCClientPostLogoutRedirectURIHas +
 		"an invalid value: post logout redirect uri '%s' must not have a fragment"
+	errFmtOIDCClientPostLogoutRedirectURIScheme = errFmtOIDCClientPostLogoutRedirectURIHas +
+		"an invalid value: post logout redirect uri '%s' must not use the '%s' scheme"
 
 	errFmtOIDCClientBackChannelLogoutURIIs           = errFmtOIDCClientOption + "'backchannel_logout_uri' with value '%s' "
 	errFmtOIDCClientBackChannelLogoutURICantBeParsed = errFmtOIDCClientBackChannelLogoutURIIs + "could not be parsed: %v"
@@ -34,6 +37,10 @@ const (
 	errFmtOIDCClientBackChannelLogoutSessionRequiredNoURI = errFmtOIDCClientOption +
 		"'backchannel_logout_session_required' is true but 'backchannel_logout_uri' is absent"
 )
+
+// postLogoutRedirectURIForbiddenSchemes are schemes a browser would execute or read locally rather than navigate to.
+// Custom schemes stay allowed for native clients.
+var postLogoutRedirectURIForbiddenSchemes = []string{"javascript", "data", "vbscript", "file", "blob"}
 
 func validateOIDCClientPostLogoutRedirectURIs(c int, config *schema.IdentityProvidersOpenIDConnect, validator *schema.StructValidator) {
 	var (
@@ -51,6 +58,8 @@ func validateOIDCClientPostLogoutRedirectURIs(c int, config *schema.IdentityProv
 			validator.Push(fmt.Errorf(errFmtOIDCClientPostLogoutRedirectURINotAbsolute, config.Clients[c].ID, uri))
 		} else if parsed.Fragment != "" {
 			validator.Push(fmt.Errorf(errFmtOIDCClientPostLogoutRedirectURIFragment, config.Clients[c].ID, uri))
+		} else if scheme := strings.ToLower(parsed.Scheme); utils.IsStringInSlice(scheme, postLogoutRedirectURIForbiddenSchemes) {
+			validator.Push(fmt.Errorf(errFmtOIDCClientPostLogoutRedirectURIScheme, config.Clients[c].ID, uri, scheme))
 		}
 	}
 

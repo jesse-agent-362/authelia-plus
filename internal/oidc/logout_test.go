@@ -8,9 +8,10 @@ import (
 	"encoding/json"
 	"testing"
 
-	oauthelia2 "authelia.com/provider/oauth2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	oauthelia2 "authelia.com/provider/oauth2"
 
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/oidc"
@@ -18,6 +19,7 @@ import (
 
 // authelia-plus: tests for OpenID Connect RP-Initiated Logout 1.0 and Back-Channel Logout 1.0.
 
+//nolint:gosec // Test Credentials.
 func TestOpenIDConnectProvider_LogoutDiscovery(t *testing.T) {
 	provider := oidc.NewOpenIDConnectProvider(&schema.Configuration{
 		IdentityProviders: schema.IdentityProviders{

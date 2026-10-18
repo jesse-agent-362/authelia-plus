@@ -11,7 +11,10 @@ import (
 // authelia-plus: OpenID Connect RP-Initiated Logout 1.0 and Back-Channel Logout 1.0.
 
 const (
-	EndpointEndSession     = "end-session"
+	// EndpointEndSession is the name of the OpenID Connect RP-Initiated Logout 1.0 end session endpoint.
+	EndpointEndSession = "end-session"
+
+	// EndpointPathEndSession is the path of the end session endpoint.
 	EndpointPathEndSession = EndpointPathRoot + "/" + EndpointEndSession
 )
 

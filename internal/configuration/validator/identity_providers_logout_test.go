@@ -36,6 +36,15 @@ func TestValidateOIDCClientPostLogoutRedirectURIs(t *testing.T) {
 			[]string{"identity_providers: oidc: clients: client 'app': option 'post_logout_redirect_uris' has an invalid value: post logout redirect uri 'http://abc@%two' could not be parsed: parse \"http://abc@%two\": invalid URL escape \"%tw\""},
 		},
 		{
+			"ShouldErrorScriptSchemes",
+			[]string{"javascript:alert(1)", "JavaScript:alert(2)", "data:text/html,hi"},
+			[]string{
+				"identity_providers: oidc: clients: client 'app': option 'post_logout_redirect_uris' has an invalid value: post logout redirect uri 'javascript:alert(1)' must not use the 'javascript' scheme",
+				"identity_providers: oidc: clients: client 'app': option 'post_logout_redirect_uris' has an invalid value: post logout redirect uri 'JavaScript:alert(2)' must not use the 'javascript' scheme",
+				"identity_providers: oidc: clients: client 'app': option 'post_logout_redirect_uris' has an invalid value: post logout redirect uri 'data:text/html,hi' must not use the 'data' scheme",
+			},
+		},
+		{
 			"ShouldErrorDuplicates",
 			[]string{"https://app.example.com", "https://app.example.com"},
 			[]string{"identity_providers: oidc: clients: client 'app': option 'post_logout_redirect_uris' must have unique values but the values 'https://app.example.com' are duplicated"},

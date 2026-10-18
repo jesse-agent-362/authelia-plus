@@ -6,11 +6,13 @@ package handlers
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
-	oauthelia2 "authelia.com/provider/oauth2"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+
+	oauthelia2 "authelia.com/provider/oauth2"
 
 	"github.com/authelia/authelia/v4/internal/middlewares"
 	"github.com/authelia/authelia/v4/internal/oidc"
@@ -78,7 +80,7 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 		target.RawQuery = query.Encode()
 	}
 
-	http.Redirect(rw, r, target.String(), http.StatusFound)
+	http.Redirect(rw, r, target.String(), http.StatusFound) //nolint:gosec // Matched exactly against the client's registered post logout redirect URIs.
 }
 
 // oauth2EndSessionHintMatches returns true when the subject of the request's validated 'id_token_hint' belongs to the
@@ -210,15 +212,22 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 	goBackChannelLogout(func() {
 		defer cancel()
 
-		for _, subject := range subjects {
-			results, err := provider.SendBackChannelLogout(dctx, oauthelia2.NewBackChannelLogoutRequest(subject, sid, clients[subject]))
-			if err != nil {
-				logger.WithError(err).Errorf("Back-Channel Logout for user '%s' could not be performed", username)
-				continue
-			}
+		// Each subject is delivered concurrently so a hung client in one group can't spend the others' budget.
+		var wg sync.WaitGroup
 
-			logBackChannelLogoutResults(logger, username, results)
+		for _, subject := range subjects {
+			wg.Go(func() {
+				results, err := provider.SendBackChannelLogout(dctx, oauthelia2.NewBackChannelLogoutRequest(subject, sid, clients[subject]))
+				if err != nil {
+					logger.WithError(err).Errorf("Back-Channel Logout for user '%s' could not be performed", username)
+					return
+				}
+
+				logBackChannelLogoutResults(logger, username, results)
+			})
 		}
+
+		wg.Wait()
 	})
 }
 

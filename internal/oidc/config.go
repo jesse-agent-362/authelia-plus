@@ -83,6 +83,11 @@ func NewConfig(config *schema.IdentityProvidersOpenIDConnect, issuer *Issuer, te
 	// authelia-plus: used to validate the 'id_token_hint' of RP-Initiated Logout requests.
 	c.Strategy.IDTokenValidation = &openid.DefaultIDTokenValidationStrategy{Strategy: c.Strategy.JWT}
 
+	// authelia-plus: created up front because Logout Tokens are delivered from background goroutines, which would race
+	// on the lazy initialisation in GetHTTPClient. Its default logger writes unformatted lines to stderr, so it is off.
+	c.HTTPClient = retryablehttp.NewClient()
+	c.HTTPClient.Logger = nil
+
 	return c
 }
 
