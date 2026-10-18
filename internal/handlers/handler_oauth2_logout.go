@@ -5,10 +5,7 @@
 package handlers
 
 import (
-	"encoding/json"
-	"errors"
 	"net/http"
-	"net/url"
 	"time"
 
 	oauthelia2 "authelia.com/provider/oauth2"
@@ -26,10 +23,11 @@ import (
 // OAuth2EndSession handles the end session endpoint, as per OpenID Connect RP-Initiated Logout 1.0: a Relying Party
 // sends the user agent here to log the user out of Authelia, and optionally to be sent back afterwards.
 //
-// The request is validated first; on failure nothing is logged out and no redirect happens, so an error can never
-// bounce the user to an unregistered URI. When an 'id_token_hint' names a different user than the one logged in, the
-// session is left alone: the hint is evidence the Relying Party wants that user's session ended, not this one. The
-// End-User is not asked to confirm, matching the portal's /logout which doesn't either.
+// The session is only ended when the request carries a valid 'id_token_hint' for the logged in user. The specification
+// expects the End-User to be asked to confirm a logout without one, as anyone can link a user agent here; until there
+// is a confirmation page such requests log nobody out. The user agent is sent to the requested
+// 'post_logout_redirect_uri' only when it validates against the client's registered URIs, and to the portal in every
+// other case, including invalid requests.
 //
 // https://openid.net/specs/openid-connect-rpinitiated-1_0.html
 func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
@@ -37,7 +35,7 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 	if err != nil {
 		ctx.GetLogger().Errorf("End Session Request could not be processed: %s", oauthelia2.ErrorToDebugRFC6749Error(err))
 
-		writeOAuth2EndSessionError(rw, err)
+		oauth2EndSessionRedirectPortal(ctx, rw, r)
 
 		return
 	}
@@ -51,7 +49,12 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 	if userSession, err := ctx.GetSession(); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("End Session Request from client with id '%s' could not load the user session", clientID)
 	} else if !userSession.IsAnonymous() {
-		if oauth2EndSessionHintMatches(ctx, requester, &userSession) {
+		switch {
+		case requester.GetIDTokenHint() == "":
+			ctx.GetLogger().Infof("End Session Request from client with id '%s' has no 'id_token_hint': the session of user '%s' was not ended", clientID, userSession.Username)
+		case !oauth2EndSessionHintMatches(ctx, requester, &userSession):
+			ctx.GetLogger().Warnf("End Session Request from client with id '%s' has an 'id_token_hint' for a different user than '%s': the session was not ended", clientID, userSession.Username)
+		default:
 			oauth2Logout(ctx, &userSession)
 
 			if err = ctx.DestroySession(); err != nil {
@@ -59,37 +62,28 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 			}
 
 			ctx.GetLogger().Debugf("End Session Request from client with id '%s' logged out user '%s'", clientID, userSession.Username)
-		} else {
-			ctx.GetLogger().Warnf("End Session Request from client with id '%s' has an 'id_token_hint' for a different user than '%s': the session was not ended", clientID, userSession.Username)
 		}
 	}
 
-	var target *url.URL
-
-	if target = requester.GetPostLogoutRedirectURI(); target != nil {
-		if state := requester.GetState(); state != "" {
-			query := target.Query()
-			query.Set(oidc.FormParameterState, state)
-			target.RawQuery = query.Encode()
-		}
-	} else if target, err = ctx.IssuerURL(); err != nil {
-		ctx.GetLogger().WithError(err).Error("End Session Request could not determine the issuer to redirect to")
-
-		writeOAuth2EndSessionError(rw, oidc.ErrEffectiveIssuer.WithWrap(err))
+	target := requester.GetPostLogoutRedirectURI()
+	if target == nil {
+		oauth2EndSessionRedirectPortal(ctx, rw, r)
 
 		return
+	}
+
+	if state := requester.GetState(); state != "" {
+		query := target.Query()
+		query.Set(oidc.FormParameterState, state)
+		target.RawQuery = query.Encode()
 	}
 
 	http.Redirect(rw, r, target.String(), http.StatusFound)
 }
 
-// oauth2EndSessionHintMatches returns true when the request has no 'id_token_hint', or its subject belongs to the
+// oauth2EndSessionHintMatches returns true when the subject of the request's validated 'id_token_hint' belongs to the
 // logged in user.
 func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthelia2.RPInitiatedLogoutRequester, userSession *session.UserSession) bool {
-	if requester.GetIDTokenHint() == "" {
-		return true
-	}
-
 	subject, err := uuid.Parse(requester.GetSubject())
 	if err != nil {
 		return false
@@ -103,17 +97,17 @@ func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthel
 	return opaque.Username == userSession.Username
 }
 
-func writeOAuth2EndSessionError(rw http.ResponseWriter, err error) {
-	var rfc *oauthelia2.RFC6749Error
+func oauth2EndSessionRedirectPortal(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
+	portal, err := ctx.IssuerURL()
+	if err != nil {
+		ctx.GetLogger().WithError(err).Error("End Session Request could not determine the portal to redirect to")
 
-	if !errors.As(err, &rfc) {
-		rfc = oauthelia2.ErrServerError
+		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		return
 	}
 
-	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-	rw.WriteHeader(rfc.StatusCode())
-
-	_ = json.NewEncoder(rw).Encode(map[string]string{"error": rfc.ErrorField, "error_description": rfc.GetDescription()})
+	http.Redirect(rw, r, portal.String(), http.StatusFound)
 }
 
 // handleOAuth2AuthorizationBackChannelLogout gives the ID Token a 'sid' claim and records the client against the

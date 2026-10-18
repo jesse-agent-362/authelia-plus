@@ -354,24 +354,17 @@ func TestOAuth2EndSession(t *testing.T) {
 		assert.Equal(t, expected, !userSession.IsAnonymous())
 	}
 
-	t.Run("ShouldLogoutAndRedirectWithState", func(t *testing.T) {
-		mock := setup(t)
-		defer mock.Close()
+	const testOIDCPortalURL = "https://login.example.com:8080"
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+	endSession := func(t *testing.T, mock *mocks.MockAutheliaCtx, method string, values url.Values) (code int, location string) {
+		t.Helper()
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
-			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
-			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
-			oidc.FormParameterState:                    []string{"abc123"},
-		})
+		rw, r := newTestOAuth2Request(t, method, testOIDCEndSessionEndpoint, values)
 
 		OAuth2EndSession(mock.Ctx, rw, r)
 
-		assert.Equal(t, http.StatusFound, rw.Code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI+"?state=abc123", rw.Header().Get(fasthttp.HeaderLocation))
-		assertLoggedIn(t, mock, false)
-	})
+		return rw.Code, rw.Header().Get(fasthttp.HeaderLocation)
+	}
 
 	t.Run("ShouldLogoutWithMatchingIDTokenHint", func(t *testing.T) {
 		mock := setup(t)
@@ -381,16 +374,64 @@ func TestOAuth2EndSession(t *testing.T) {
 
 		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodPost, testOIDCEndSessionEndpoint, url.Values{
+		code, location := endSession(t, mock, fasthttp.MethodPost, url.Values{
 			testOIDCFormParameterIDTokenHint:           []string{hint},
 			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			oidc.FormParameterState:                    []string{"abc123"},
 		})
 
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusFound, rw.Code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI, rw.Header().Get(fasthttp.HeaderLocation))
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI+"?state=abc123", location)
 		assertLoggedIn(t, mock, false)
+	})
+
+	t.Run("ShouldLogoutWithMatchingIDTokenHintAndNotifyBackChannel", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assert.Len(t, receiver.Tokens(), 1)
+		assertLoggedIn(t, mock, false)
+	})
+
+	t.Run("ShouldNotLogoutCrossSiteLinkWithoutParameters", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		// No revocation expectation is set, so revoking fails the test.
+		code, location := endSession(t, mock, fasthttp.MethodGet, nil)
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assertLoggedIn(t, mock, true)
+	})
+
+	t.Run("ShouldNotLogoutWithoutIDTokenHintButRedirectWithState", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			oidc.FormParameterState:                    []string{"abc123"},
+		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI+"?state=abc123", location)
+		assertLoggedIn(t, mock, true)
 	})
 
 	t.Run("ShouldNotLogoutWithIDTokenHintForAnotherUser", func(t *testing.T) {
@@ -404,66 +445,17 @@ func TestOAuth2EndSession(t *testing.T) {
 
 		require.NoError(t, mock.Ctx.SaveSession(other))
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
 			testOIDCFormParameterIDTokenHint:           []string{hint},
 			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
 		})
 
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusFound, rw.Code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI, rw.Header().Get(fasthttp.HeaderLocation))
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
 		assertLoggedIn(t, mock, true)
 	})
 
-	t.Run("ShouldRejectUnregisteredPostLogoutRedirectURI", func(t *testing.T) {
-		mock := setup(t)
-		defer mock.Close()
-
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
-			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
-			testOIDCFormParameterPostLogoutRedirectURI: []string{"https://evil.example.com/"},
-		})
-
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusBadRequest, rw.Code)
-		assert.Empty(t, rw.Header().Get(fasthttp.HeaderLocation))
-		assert.Equal(t, "invalid_request", getTestOAuth2ErrorResponse(t, rw)["error"])
-		assertLoggedIn(t, mock, true)
-	})
-
-	t.Run("ShouldRejectPostLogoutRedirectURIWithoutClient", func(t *testing.T) {
-		mock := setup(t)
-		defer mock.Close()
-
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
-			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
-		})
-
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusBadRequest, rw.Code)
-		assert.Equal(t, "invalid_request", getTestOAuth2ErrorResponse(t, rw)["error"])
-		assertLoggedIn(t, mock, true)
-	})
-
-	t.Run("ShouldRejectUnknownClient", func(t *testing.T) {
-		mock := setup(t)
-		defer mock.Close()
-
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
-			oidc.FormParameterClientID: []string{"unknown"},
-		})
-
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.NotEqual(t, http.StatusFound, rw.Code)
-		assert.Equal(t, "invalid_client", getTestOAuth2ErrorResponse(t, rw)["error"])
-		assertLoggedIn(t, mock, true)
-	})
-
-	t.Run("ShouldRejectForgedIDTokenHint", func(t *testing.T) {
+	t.Run("ShouldNotLogoutWithForgedIDTokenHint", func(t *testing.T) {
 		mock := setup(t)
 		defer mock.Close()
 
@@ -471,46 +463,60 @@ func TestOAuth2EndSession(t *testing.T) {
 		parts := strings.Split(hint, ".")
 		parts[2] = base64.RawURLEncoding.EncodeToString([]byte("not a signature"))
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
-			testOIDCFormParameterIDTokenHint: []string{strings.Join(parts, ".")},
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			testOIDCFormParameterIDTokenHint:           []string{strings.Join(parts, ".")},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
 		})
 
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusBadRequest, rw.Code)
-		assert.Equal(t, "invalid_request", getTestOAuth2ErrorResponse(t, rw)["error"])
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
 		assertLoggedIn(t, mock, true)
 	})
 
-	t.Run("ShouldLogoutAndRedirectToIssuerWithoutParameters", func(t *testing.T) {
-		mock := setup(t)
-		defer mock.Close()
+	t.Run("ShouldRedirectToPortalForInvalidRequests", func(t *testing.T) {
+		testCases := []struct {
+			name   string
+			values url.Values
+		}{
+			{"UnregisteredPostLogoutRedirectURI", url.Values{
+				oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
+				testOIDCFormParameterPostLogoutRedirectURI: []string{"https://evil.example.com/"},
+			}},
+			{"PostLogoutRedirectURIWithoutClient", url.Values{
+				testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			}},
+			{"UnknownClient", url.Values{
+				oidc.FormParameterClientID:                 []string{"unknown"},
+				testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			}},
+		}
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				mock := setup(t)
+				defer mock.Close()
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, nil)
+				code, location := endSession(t, mock, fasthttp.MethodGet, tc.values)
 
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusFound, rw.Code)
-		assert.Equal(t, "https://login.example.com:8080", rw.Header().Get(fasthttp.HeaderLocation))
-		assertLoggedIn(t, mock, false)
+				assert.Equal(t, http.StatusFound, code)
+				assert.Equal(t, testOIDCPortalURL, location)
+				assertLoggedIn(t, mock, true)
+			})
+		}
 	})
 
-	t.Run("ShouldRedirectAnonymousUserWithoutRevoking", func(t *testing.T) {
+	t.Run("ShouldRedirectAnonymousUser", func(t *testing.T) {
 		mock := setup(t)
 		defer mock.Close()
 
 		require.NoError(t, mock.Ctx.DestroySession())
 
-		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCEndSessionEndpoint, url.Values{
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
 			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
 			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
 		})
 
-		OAuth2EndSession(mock.Ctx, rw, r)
-
-		assert.Equal(t, http.StatusFound, rw.Code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI, rw.Header().Get(fasthttp.HeaderLocation))
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
 	})
 }
