@@ -143,7 +143,9 @@ type RegisteredClient struct {
 	JSONWebKeys    *jose.JSONWebKeySet
 	JSONWebKeysURI *url.URL
 
-	PostLogoutRedirectURIs []string
+	PostLogoutRedirectURIs           []string
+	BackChannelLogoutURI             string
+	BackChannelLogoutSessionRequired bool
 }
 
 // Client represents the internal client definitions.

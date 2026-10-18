@@ -164,6 +164,8 @@ var Keys = []string{
 	"identity_providers.oidc.clients[].authorization_policy",
 	"identity_providers.oidc.clients[].authorization_signed_response_alg",
 	"identity_providers.oidc.clients[].authorization_signed_response_key_id",
+	"identity_providers.oidc.clients[].backchannel_logout_session_required",
+	"identity_providers.oidc.clients[].backchannel_logout_uri",
 	"identity_providers.oidc.clients[].claims_policy",
 	"identity_providers.oidc.clients[].client_id",
 	"identity_providers.oidc.clients[].client_name",

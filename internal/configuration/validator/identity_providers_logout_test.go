@@ -58,6 +58,73 @@ func TestValidateOIDCClientPostLogoutRedirectURIs(t *testing.T) {
 	}
 }
 
+func TestValidateOIDCClientBackChannelLogout(t *testing.T) {
+	testCases := []struct {
+		name     string
+		uri      string
+		required bool
+		expected []string
+	}{
+		{"ShouldAllowNone", "", false, nil},
+		{"ShouldAllowSameOrigin", "https://app.example.com/backchannel-logout", true, nil},
+		{"ShouldAllowSameOriginOtherRedirect", "http://app.internal:8080/logout", false, nil},
+		{
+			"ShouldErrorSessionRequiredWithoutURI", "", true,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_session_required' is true but 'backchannel_logout_uri' is absent"},
+		},
+		{
+			"ShouldErrorOtherHost", "https://evil.example.com/logout", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'https://evil.example.com/logout' must have the same scheme, host and port as one of the 'redirect_uris'"},
+		},
+		{
+			"ShouldErrorOtherPort", "https://app.example.com:8443/logout", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'https://app.example.com:8443/logout' must have the same scheme, host and port as one of the 'redirect_uris'"},
+		},
+		{
+			"ShouldErrorOtherScheme", "http://app.example.com/logout", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'http://app.example.com/logout' must have the same scheme, host and port as one of the 'redirect_uris'"},
+		},
+		{
+			"ShouldErrorNotHTTP", "app://logout", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'app://logout' must be an absolute 'http' or 'https' URI"},
+		},
+		{
+			"ShouldErrorRelative", "/logout", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value '/logout' must be an absolute 'http' or 'https' URI"},
+		},
+		{
+			"ShouldErrorFragment", "https://app.example.com/logout#x", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'https://app.example.com/logout#x' must not have a fragment"},
+		},
+		{
+			"ShouldErrorUnparsable", "http://abc@%two", false,
+			[]string{"identity_providers: oidc: clients: client 'app': option 'backchannel_logout_uri' with value 'http://abc@%two' could not be parsed: parse \"http://abc@%two\": invalid URL escape \"%tw\""},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &schema.IdentityProvidersOpenIDConnect{
+				Clients: []schema.IdentityProvidersOpenIDConnectClient{
+					{
+						ID:                               "app",
+						RedirectURIs:                     []string{"https://app.example.com/callback", "http://app.internal:8080/callback"},
+						BackChannelLogoutURI:             tc.uri,
+						BackChannelLogoutSessionRequired: tc.required,
+					},
+				},
+			}
+
+			validator := schema.NewStructValidator()
+
+			validateOIDCClientBackChannelLogout(0, config, validator)
+
+			assert.Len(t, validator.Warnings(), 0)
+			assertErrorStrings(t, tc.expected, validator.Errors())
+		})
+	}
+}
+
 func assertErrorStrings(t *testing.T, expected []string, actual []error) {
 	t.Helper()
 

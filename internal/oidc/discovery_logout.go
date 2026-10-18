@@ -8,16 +8,21 @@ import (
 	"fmt"
 )
 
-// authelia-plus: OpenID Connect RP-Initiated Logout 1.0.
+// authelia-plus: OpenID Connect RP-Initiated Logout 1.0 and Back-Channel Logout 1.0.
 
 const (
 	EndpointEndSession     = "end-session"
 	EndpointPathEndSession = EndpointPathRoot + "/" + EndpointEndSession
 )
 
-// setLogoutDiscovery advertises the end session endpoint.
+// setLogoutDiscovery advertises the end session endpoint and Back-Channel Logout support.
 func setLogoutDiscovery(options *OpenIDConnectWellKnownConfiguration, issuer string) {
 	options.OpenIDConnectRPInitiatedLogoutDiscoveryOptions = &OpenIDConnectRPInitiatedLogoutDiscoveryOptions{
 		EndSessionEndpoint: fmt.Sprintf("%s%s", issuer, EndpointPathEndSession),
+	}
+
+	options.OpenIDConnectBackChannelLogoutDiscoveryOptions = &OpenIDConnectBackChannelLogoutDiscoveryOptions{
+		BackChannelLogoutSupported:        true,
+		BackChannelLogoutSessionSupported: true,
 	}
 }

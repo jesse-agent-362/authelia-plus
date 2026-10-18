@@ -16,7 +16,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/oidc"
 )
 
-// authelia-plus: tests for OpenID Connect RP-Initiated Logout 1.0.
+// authelia-plus: tests for OpenID Connect RP-Initiated Logout 1.0 and Back-Channel Logout 1.0.
 
 func TestOpenIDConnectProvider_LogoutDiscovery(t *testing.T) {
 	provider := oidc.NewOpenIDConnectProvider(&schema.Configuration{
@@ -48,14 +48,18 @@ func TestOpenIDConnectProvider_LogoutDiscovery(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &disco))
 
 	assert.Equal(t, "https://example.com/api/oidc/end-session", disco["end_session_endpoint"])
+	assert.Equal(t, true, disco["backchannel_logout_supported"])
+	assert.Equal(t, true, disco["backchannel_logout_session_supported"])
 }
 
 func TestNewClient_Logout(t *testing.T) {
 	t.Run("ShouldMapLogoutOptions", func(t *testing.T) {
 		client := oidc.NewClient(schema.IdentityProvidersOpenIDConnectClient{
-			ID:                     myclient,
-			RedirectURIs:           []string{examplecom},
-			PostLogoutRedirectURIs: []string{"https://example.com/logged-out", "https://example.com/bye"},
+			ID:                               myclient,
+			RedirectURIs:                     []string{examplecom},
+			PostLogoutRedirectURIs:           []string{"https://example.com/logged-out", "https://example.com/bye"},
+			BackChannelLogoutURI:             "https://example.com/backchannel",
+			BackChannelLogoutSessionRequired: true,
 		}, &schema.IdentityProvidersOpenIDConnect{}, nil)
 
 		rp, ok := client.(oauthelia2.RPInitiatedLogoutClient)
@@ -63,6 +67,11 @@ func TestNewClient_Logout(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, []string{"https://example.com/logged-out", "https://example.com/bye"}, rp.GetPostLogoutRedirectURIs())
 
+		bc, ok := client.(oauthelia2.BackChannelLogoutClient)
+
+		require.True(t, ok)
+		assert.Equal(t, "https://example.com/backchannel", bc.GetBackChannelLogoutURI())
+		assert.True(t, bc.GetBackChannelLogoutSessionRequired())
 	})
 
 	t.Run("ShouldDefaultToNoLogoutOptions", func(t *testing.T) {
@@ -73,5 +82,10 @@ func TestNewClient_Logout(t *testing.T) {
 		require.True(t, ok)
 		assert.Empty(t, rp.GetPostLogoutRedirectURIs())
 
+		bc, ok := client.(oauthelia2.BackChannelLogoutClient)
+
+		require.True(t, ok)
+		assert.Equal(t, "", bc.GetBackChannelLogoutURI())
+		assert.False(t, bc.GetBackChannelLogoutSessionRequired())
 	})
 }

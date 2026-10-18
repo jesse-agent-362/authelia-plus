@@ -740,6 +740,7 @@ func validateOIDCClient(ctx *ValidateCtx, c int, config *schema.IdentityProvider
 	validateOIDCClientRedirectURIs(c, config, validator, errDeprecatedFunc)
 	validateOIDCClientRequestURIs(c, config, validator)
 	validateOIDCClientPostLogoutRedirectURIs(c, config, validator)
+	validateOIDCClientBackChannelLogout(c, config, validator)
 
 	validateOIDDClientSigningAlgs(c, config, validator)
 	validateOIDDClientEncryptionAlgs(c, config, validator)

@@ -6,10 +6,13 @@ package handlers
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,19 +20,81 @@ import (
 	"github.com/valyala/fasthttp"
 	"go.uber.org/mock/gomock"
 
+	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/mocks"
 	"github.com/authelia/authelia/v4/internal/oidc"
 )
 
-// authelia-plus: tests for OpenID Connect RP-Initiated Logout 1.0, and token revocation on logout.
+// authelia-plus: tests for OpenID Connect RP-Initiated Logout 1.0 and Back-Channel Logout 1.0.
 
 const (
-	testOIDCEndSessionEndpoint    = "https://login.example.com:8080/api/oidc/end-session"
-	testOIDCPostLogoutRedirectURI = "https://app.example.com/logged-out"
+	testOIDCEndSessionEndpoint     = "https://login.example.com:8080/api/oidc/end-session"
+	testOIDCPostLogoutRedirectURI  = "https://app.example.com/logged-out"
+	testOIDCBackChannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
 
 	testOIDCFormParameterIDTokenHint           = "id_token_hint"
 	testOIDCFormParameterPostLogoutRedirectURI = "post_logout_redirect_uri"
 )
+
+// testBackChannelLogoutReceiver is a Relying Party's back-channel logout endpoint which records the Logout Tokens it
+// receives.
+type testBackChannelLogoutReceiver struct {
+	*httptest.Server
+
+	mu     sync.Mutex
+	tokens []string
+}
+
+func newTestBackChannelLogoutReceiver(t *testing.T) (receiver *testBackChannelLogoutReceiver) {
+	t.Helper()
+
+	receiver = &testBackChannelLogoutReceiver{}
+
+	receiver.Server = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			rw.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		receiver.mu.Lock()
+		receiver.tokens = append(receiver.tokens, r.PostForm.Get("logout_token"))
+		receiver.mu.Unlock()
+
+		rw.WriteHeader(http.StatusOK)
+	}))
+
+	t.Cleanup(receiver.Close)
+
+	return receiver
+}
+
+func (r *testBackChannelLogoutReceiver) Tokens() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.tokens...)
+}
+
+// setupTestOIDCBackChannelLogoutInline makes Logout Token delivery synchronous so tests can assert on it.
+func setupTestOIDCBackChannelLogoutInline(t *testing.T) {
+	t.Helper()
+
+	original := goBackChannelLogout
+	goBackChannelLogout = func(deliver func()) { deliver() }
+
+	t.Cleanup(func() { goBackChannelLogout = original })
+}
+
+func newTestOIDCBackChannelLogoutClient(t *testing.T, uri string) schema.IdentityProvidersOpenIDConnectClient {
+	t.Helper()
+
+	client := newTestOIDCAuthorizationCodeClient(t)
+	client.ConsentMode = "implicit"
+	client.BackChannelLogoutURI = uri
+	client.PostLogoutRedirectURIs = []string{testOIDCPostLogoutRedirectURI}
+
+	return client
+}
 
 // mustGetTestOIDCIDToken runs the authorization code flow and returns the ID Token.
 func mustGetTestOIDCIDToken(t *testing.T, mock *mocks.MockAutheliaCtx) (idToken string) {
@@ -56,25 +121,98 @@ func mustGetTestOIDCIDToken(t *testing.T, mock *mocks.MockAutheliaCtx) (idToken 
 	return idToken
 }
 
-func TestOAuth2Logout(t *testing.T) {
-	setup := func(t *testing.T) (mock *mocks.MockAutheliaCtx) {
-		t.Helper()
+// mustDecodeTestJWT returns the unverified header and claims of a JWT.
+func mustDecodeTestJWT(t *testing.T, token string) (header, claims map[string]any) {
+	t.Helper()
 
-		mock = mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+	parts := strings.Split(token, ".")
+
+	require.Len(t, parts, 3)
+
+	for i, target := range []*map[string]any{&header, &claims} {
+		raw, err := base64.RawURLEncoding.DecodeString(parts[i])
+
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(raw, target))
+	}
+
+	return header, claims
+}
+
+func TestOAuth2AuthorizationBackChannelLogout(t *testing.T) {
+	t.Run("ShouldNotChangeClientsWithoutBackChannelLogoutURI", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
 
 		client := newTestOIDCAuthorizationCodeClient(t)
 		client.ConsentMode = "implicit"
 
 		setupTestOIDCAuthorizationCodeFlow(t, mock, client)
 
-		mustGetTestOIDCIDToken(t, mock)
+		_, claims := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
 
-		return mock
-	}
+		assert.NotContains(t, claims, oidc.ClaimSessionID)
 
-	t.Run("ShouldRevokeTokens", func(t *testing.T) {
-		mock := setup(t)
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		assert.Nil(t, userSession.OpenIDConnect)
+	})
+
+	t.Run("ShouldIssueSessionIDAndRecordClient", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
 		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, "https://app.example.com/backchannel-logout"))
+
+		_, claims := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		require.NotNil(t, userSession.OpenIDConnect)
+		assert.Len(t, userSession.OpenIDConnect.SessionID, 32)
+		assert.Equal(t, userSession.OpenIDConnect.SessionID, claims[oidc.ClaimSessionID])
+
+		subject := mustGetTestOIDCSubject(t, mock, testOIDCAuthorizationCodeID)
+
+		require.Len(t, userSession.OpenIDConnect.Clients, 1)
+		assert.Equal(t, testOIDCAuthorizationCodeID, userSession.OpenIDConnect.Clients[0].ClientID)
+		assert.Equal(t, subject.String(), userSession.OpenIDConnect.Clients[0].Subject)
+		assert.Equal(t, subject.String(), claims[oidc.ClaimSubject])
+	})
+
+	t.Run("ShouldReuseSessionIDAcrossAuthorizations", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, "https://app.example.com/backchannel-logout"))
+
+		_, first := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
+		_, second := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
+
+		assert.Equal(t, first[oidc.ClaimSessionID], second[oidc.ClaimSessionID])
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		require.NotNil(t, userSession.OpenIDConnect)
+		assert.Len(t, userSession.OpenIDConnect.Clients, 1)
+	})
+}
+
+func TestOAuth2Logout(t *testing.T) {
+	t.Run("ShouldRevokeTokensAndSendLogoutToken", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		_, idClaims := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
 
 		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
 
@@ -83,11 +221,38 @@ func TestOAuth2Logout(t *testing.T) {
 		require.NoError(t, err)
 
 		oauth2Logout(mock.Ctx, &userSession)
+
+		tokens := receiver.Tokens()
+
+		require.Len(t, tokens, 1)
+
+		header, claims := mustDecodeTestJWT(t, tokens[0])
+
+		assert.Equal(t, "logout+jwt", header["typ"])
+		assert.Equal(t, idClaims[oidc.ClaimIssuer], claims[oidc.ClaimIssuer])
+		assert.Equal(t, idClaims[oidc.ClaimSubject], claims[oidc.ClaimSubject])
+		assert.Equal(t, idClaims[oidc.ClaimSessionID], claims[oidc.ClaimSessionID])
+		assert.Contains(t, claims[oidc.ClaimAudience], testOIDCAuthorizationCodeID)
+		assert.NotContains(t, claims, "nonce")
+		assert.NotEmpty(t, claims["jti"])
+
+		events, ok := claims["events"].(map[string]any)
+
+		require.True(t, ok)
+		assert.Contains(t, events, testOIDCBackChannelLogoutEvent)
 	})
 
-	t.Run("ShouldLogRevocationFailure", func(t *testing.T) {
-		mock := setup(t)
+	t.Run("ShouldSendLogoutTokenWhenRevocationFails", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
 		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		mustGetTestOIDCIDToken(t, mock)
 
 		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(errors.New("database is locked"))
 
@@ -97,7 +262,30 @@ func TestOAuth2Logout(t *testing.T) {
 
 		oauth2Logout(mock.Ctx, &userSession)
 
+		assert.Len(t, receiver.Tokens(), 1)
 		assert.Contains(t, mock.Hook.AllEntries()[0].Message, "Error occurred revoking the OpenID Connect 1.0 tokens of user 'john'")
+	})
+
+	t.Run("ShouldOnlyRevokeTokensWithoutBackChannelClients", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		client := newTestOIDCAuthorizationCodeClient(t)
+		client.ConsentMode = "implicit"
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, client)
+
+		mustGetTestOIDCIDToken(t, mock)
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+
+		oauth2Logout(mock.Ctx, &userSession)
 	})
 
 	t.Run("ShouldDoNothingWithoutProvider", func(t *testing.T) {
@@ -114,13 +302,14 @@ func TestOAuth2Logout(t *testing.T) {
 }
 
 func TestLogoutPOSTOpenIDConnect(t *testing.T) {
+	setupTestOIDCBackChannelLogoutInline(t)
+
+	receiver := newTestBackChannelLogoutReceiver(t)
+
 	mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
 	defer mock.Close()
 
-	client := newTestOIDCAuthorizationCodeClient(t)
-	client.ConsentMode = "implicit"
-
-	setupTestOIDCAuthorizationCodeFlow(t, mock, client)
+	setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
 
 	mustGetTestOIDCIDToken(t, mock)
 
@@ -131,6 +320,7 @@ func TestLogoutPOSTOpenIDConnect(t *testing.T) {
 	LogoutPOST(mock.Ctx)
 
 	assert.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+	assert.Len(t, receiver.Tokens(), 1)
 
 	userSession, err := mock.Ctx.GetSession()
 
@@ -141,6 +331,8 @@ func TestLogoutPOSTOpenIDConnect(t *testing.T) {
 func TestOAuth2EndSession(t *testing.T) {
 	setup := func(t *testing.T) (mock *mocks.MockAutheliaCtx) {
 		t.Helper()
+
+		setupTestOIDCBackChannelLogoutInline(t)
 
 		mock = mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
 

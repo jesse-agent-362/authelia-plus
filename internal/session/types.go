@@ -49,6 +49,9 @@ type UserSession struct {
 	RefreshTTL time.Time
 
 	Elevations Elevations
+
+	// OpenIDConnect tracks this session's OpenID Connect 1.0 logout state. authelia-plus.
+	OpenIDConnect *OpenIDConnectLogout `json:",omitempty"`
 }
 
 // TOTP holds the TOTP registration session data.
