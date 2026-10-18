@@ -417,6 +417,12 @@ func RegisterOpenIDConnectRoutes(r *router.Router, config *schema.Configuration,
 	r.OPTIONS(oidc.EndpointPathJWKs, policyCORSPublicGET.HandleOPTIONS)
 	r.GET(oidc.EndpointPathJWKs, middlewares.Wrap(middlewares.NewMetricsRequestOpenIDConnect(providers.Metrics, "jwks"), policyCORSPublicGET.Middleware(middlewareAPI(handlers.OAuth2JSONWebKeySetGET))))
 
+	// authelia-plus: OpenID Connect RP-Initiated Logout 1.0. Reached by the user agent, so no CORS.
+	endSession := middlewares.Wrap(middlewares.NewMetricsRequestOpenIDConnect(providers.Metrics, oidc.EndpointEndSession), bridge(middlewares.NewHTTPToAutheliaHandlerAdaptor(handlers.OAuth2EndSession)))
+
+	r.GET(oidc.EndpointPathEndSession, endSession)
+	r.POST(oidc.EndpointPathEndSession, endSession)
+
 	policyCORSAuthorization := middlewares.NewCORSPolicyBuilder().
 		WithAllowedMethods(fasthttp.MethodOptions, fasthttp.MethodGet, fasthttp.MethodPost).
 		WithAllowedOrigins(allowedOrigins...).

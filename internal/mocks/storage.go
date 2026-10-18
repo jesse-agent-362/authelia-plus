@@ -900,6 +900,20 @@ func (mr *MockStorageMockRecorder) RevokeOAuth2SessionByRequestID(ctx, sessionTy
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RevokeOAuth2SessionByRequestID", reflect.TypeOf((*MockStorage)(nil).RevokeOAuth2SessionByRequestID), ctx, sessionType, requestID)
 }
 
+// RevokeOAuth2SessionsByUsername mocks base method.
+func (m *MockStorage) RevokeOAuth2SessionsByUsername(ctx context.Context, username string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RevokeOAuth2SessionsByUsername", ctx, username)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RevokeOAuth2SessionsByUsername indicates an expected call of RevokeOAuth2SessionsByUsername.
+func (mr *MockStorageMockRecorder) RevokeOAuth2SessionsByUsername(ctx, username any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RevokeOAuth2SessionsByUsername", reflect.TypeOf((*MockStorage)(nil).RevokeOAuth2SessionsByUsername), ctx, username)
+}
+
 // RevokeOneTimeCode mocks base method.
 func (m *MockStorage) RevokeOneTimeCode(ctx context.Context, id uuid.UUID, ip model.IP) error {
 	m.ctrl.T.Helper()

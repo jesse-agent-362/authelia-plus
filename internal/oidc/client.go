@@ -36,6 +36,8 @@ func NewClient(config schema.IdentityProvidersOpenIDConnectClient, c *schema.Ide
 		ResponseTypes: config.ResponseTypes,
 		ResponseModes: []oauthelia2.ResponseModeType{},
 
+		PostLogoutRedirectURIs: config.PostLogoutRedirectURIs,
+
 		ClaimsStrategy: NewCustomClaimsStrategyFromClient(config, c.Scopes, c.ClaimsPolicies),
 
 		RequirePKCE:                config.RequirePKCE || config.PKCEChallengeMethod != "",

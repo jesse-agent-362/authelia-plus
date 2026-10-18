@@ -29,6 +29,10 @@ func LogoutPOST(ctx *middlewares.AutheliaCtx) {
 		ctx.SetJSONError(messageOperationFailed)
 	}
 
+	if userSession, err := ctx.GetSession(); err == nil {
+		oauth2Logout(ctx, &userSession)
+	}
+
 	err = ctx.DestroySession()
 	if err != nil {
 		ctx.GetLogger().WithError(err).Error("Error occurred destroying the user session during logout")

@@ -80,6 +80,9 @@ func NewConfig(config *schema.IdentityProvidersOpenIDConnect, issuer *Issuer, te
 		Config:   c,
 	}
 
+	// authelia-plus: used to validate the 'id_token_hint' of RP-Initiated Logout requests.
+	c.Strategy.IDTokenValidation = &openid.DefaultIDTokenValidationStrategy{Strategy: c.Strategy.JWT}
+
 	return c
 }
 

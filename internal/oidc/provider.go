@@ -70,6 +70,8 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 	options.IntrospectionEndpoint = fmt.Sprintf("%s%s", issuer, EndpointPathIntrospection)
 	options.RevocationEndpoint = fmt.Sprintf("%s%s", issuer, EndpointPathRevocation)
 
+	setLogoutDiscovery(&options, issuer)
+
 	return options
 }
 
