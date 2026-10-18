@@ -900,18 +900,18 @@ func (mr *MockStorageMockRecorder) RevokeOAuth2SessionByRequestID(ctx, sessionTy
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RevokeOAuth2SessionByRequestID", reflect.TypeOf((*MockStorage)(nil).RevokeOAuth2SessionByRequestID), ctx, sessionType, requestID)
 }
 
-// RevokeOAuth2SessionsByUsername mocks base method.
-func (m *MockStorage) RevokeOAuth2SessionsByUsername(ctx context.Context, username string) error {
+// RevokeOAuth2SessionsByRequestIDs mocks base method.
+func (m *MockStorage) RevokeOAuth2SessionsByRequestIDs(ctx context.Context, requestIDs []string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RevokeOAuth2SessionsByUsername", ctx, username)
+	ret := m.ctrl.Call(m, "RevokeOAuth2SessionsByRequestIDs", ctx, requestIDs)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
-// RevokeOAuth2SessionsByUsername indicates an expected call of RevokeOAuth2SessionsByUsername.
-func (mr *MockStorageMockRecorder) RevokeOAuth2SessionsByUsername(ctx, username any) *gomock.Call {
+// RevokeOAuth2SessionsByRequestIDs indicates an expected call of RevokeOAuth2SessionsByRequestIDs.
+func (mr *MockStorageMockRecorder) RevokeOAuth2SessionsByRequestIDs(ctx, requestIDs any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RevokeOAuth2SessionsByUsername", reflect.TypeOf((*MockStorage)(nil).RevokeOAuth2SessionsByUsername), ctx, username)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RevokeOAuth2SessionsByRequestIDs", reflect.TypeOf((*MockStorage)(nil).RevokeOAuth2SessionsByRequestIDs), ctx, requestIDs)
 }
 
 // RevokeOneTimeCode mocks base method.

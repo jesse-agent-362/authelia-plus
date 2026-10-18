@@ -96,6 +96,19 @@ func newTestOIDCBackChannelLogoutClient(t *testing.T, uri string) schema.Identit
 	return client
 }
 
+// expectTestOIDCRevokeSession expects the grants recorded in the current user session, and only those, to be revoked.
+func expectTestOIDCRevokeSession(t *testing.T, mock *mocks.MockAutheliaCtx) *gomock.Call {
+	t.Helper()
+
+	userSession, err := mock.Ctx.GetSession()
+
+	require.NoError(t, err)
+	require.NotNil(t, userSession.OpenIDConnect)
+	require.NotEmpty(t, userSession.OpenIDConnect.RequestIDs)
+
+	return mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), userSession.OpenIDConnect.RequestIDs)
+}
+
 // mustGetTestOIDCIDToken runs the authorization code flow and returns the ID Token.
 func mustGetTestOIDCIDToken(t *testing.T, mock *mocks.MockAutheliaCtx) (idToken string) {
 	t.Helper()
@@ -140,7 +153,7 @@ func mustDecodeTestJWT(t *testing.T, token string) (header, claims map[string]an
 }
 
 func TestOAuth2AuthorizationBackChannelLogout(t *testing.T) {
-	t.Run("ShouldNotChangeClientsWithoutBackChannelLogoutURI", func(t *testing.T) {
+	t.Run("ShouldNotIssueSessionIDToClientsWithoutBackChannelLogoutURI", func(t *testing.T) {
 		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
 		defer mock.Close()
 
@@ -156,7 +169,10 @@ func TestOAuth2AuthorizationBackChannelLogout(t *testing.T) {
 		userSession, err := mock.Ctx.GetSession()
 
 		require.NoError(t, err)
-		assert.Nil(t, userSession.OpenIDConnect)
+		require.NotNil(t, userSession.OpenIDConnect)
+		assert.Len(t, userSession.OpenIDConnect.RequestIDs, 1)
+		assert.Empty(t, userSession.OpenIDConnect.SessionID)
+		assert.Empty(t, userSession.OpenIDConnect.Clients)
 	})
 
 	t.Run("ShouldIssueSessionIDAndRecordClient", func(t *testing.T) {
@@ -197,6 +213,7 @@ func TestOAuth2AuthorizationBackChannelLogout(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, userSession.OpenIDConnect)
+		assert.Len(t, userSession.OpenIDConnect.RequestIDs, 2)
 		assert.Len(t, userSession.OpenIDConnect.Clients, 1)
 	})
 }
@@ -214,7 +231,7 @@ func TestOAuth2Logout(t *testing.T) {
 
 		_, idClaims := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
 
 		userSession, err := mock.Ctx.GetSession()
 
@@ -254,7 +271,7 @@ func TestOAuth2Logout(t *testing.T) {
 
 		mustGetTestOIDCIDToken(t, mock)
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(errors.New("database is locked"))
+		expectTestOIDCRevokeSession(t, mock).Return(errors.New("database is locked"))
 
 		userSession, err := mock.Ctx.GetSession()
 
@@ -279,12 +296,29 @@ func TestOAuth2Logout(t *testing.T) {
 
 		mustGetTestOIDCIDToken(t, mock)
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
 
 		userSession, err := mock.Ctx.GetSession()
 
 		require.NoError(t, err)
 
+		oauth2Logout(mock.Ctx, &userSession)
+	})
+
+	t.Run("ShouldDoNothingWithoutAuthorizations", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		client := newTestOIDCAuthorizationCodeClient(t)
+		client.ConsentMode = "implicit"
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, client)
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+
+		// No storage expectation is set, so any call fails the test.
 		oauth2Logout(mock.Ctx, &userSession)
 	})
 
@@ -313,7 +347,7 @@ func TestLogoutPOSTOpenIDConnect(t *testing.T) {
 
 	mustGetTestOIDCIDToken(t, mock)
 
-	mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+	expectTestOIDCRevokeSession(t, mock).Return(nil)
 
 	mock.Ctx.Request.SetBodyString("{}")
 
@@ -372,7 +406,7 @@ func TestOAuth2EndSession(t *testing.T) {
 
 		hint := mustGetTestOIDCIDToken(t, mock)
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
 
 		code, location := endSession(t, mock, fasthttp.MethodPost, url.Values{
 			testOIDCFormParameterIDTokenHint:           []string{hint},
@@ -397,7 +431,7 @@ func TestOAuth2EndSession(t *testing.T) {
 
 		hint := mustGetTestOIDCIDToken(t, mock)
 
-		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByUsername(gomock.Any(), testUsername).Return(nil)
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
 
 		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
 

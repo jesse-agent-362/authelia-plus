@@ -110,41 +110,36 @@ func oauth2EndSessionRedirectPortal(ctx *middlewares.AutheliaCtx, rw http.Respon
 	http.Redirect(rw, r, portal.String(), http.StatusFound)
 }
 
-// handleOAuth2AuthorizationBackChannelLogout gives the ID Token a 'sid' claim and records the client against the
-// user session, so the client can be sent a Logout Token when the session ends. Clients without a
-// 'backchannel_logout_uri' are left untouched: their ID Tokens carry no 'sid' and nothing is recorded.
+// handleOAuth2AuthorizationLogoutState records the authorization request against the user session, so its tokens can
+// be revoked when the session ends. Clients with a 'backchannel_logout_uri' are also recorded so they can be sent a
+// Logout Token, and their ID Tokens get a 'sid' claim. Other clients' ID Tokens are left untouched.
 //
 // The session is reloaded rather than taken from the caller: earlier steps of the request (consent) may have saved a
 // newer copy, which saving the caller's copy would undo.
-func handleOAuth2AuthorizationBackChannelLogout(ctx *middlewares.AutheliaCtx, provider *session.Session, client oidc.Client, s *oidc.Session) {
-	if c, ok := client.(oauthelia2.BackChannelLogoutClient); !ok || c.GetBackChannelLogoutURI() == "" {
-		return
-	}
-
+func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider *session.Session, client oidc.Client, requester oauthelia2.AuthorizeRequester, s *oidc.Session) {
 	userSession, err := provider.GetSession(ctx.RequestCtx)
 	if err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred loading the user session to record the OpenID Connect 1.0 logout state for client with id '%s'", client.GetID())
 		return
 	}
 
-	changed := false
-
 	if userSession.OpenIDConnect == nil {
-		userSession.OpenIDConnect = &session.OpenIDConnectLogout{SessionID: ctx.Providers.Random.StringCustom(32, random.CharSetAlphaNumeric)}
-		changed = true
+		userSession.OpenIDConnect = &session.OpenIDConnectLogout{}
 	}
 
-	s.Claims.SessionID = userSession.OpenIDConnect.SessionID
+	userSession.OpenIDConnect.RequestIDs = append(userSession.OpenIDConnect.RequestIDs, requester.GetID())
 
-	if userSession.AddOpenIDConnectLogoutClient(client.GetID(), s.Subject) {
-		changed = true
+	if c, ok := client.(oauthelia2.BackChannelLogoutClient); ok && c.GetBackChannelLogoutURI() != "" {
+		if userSession.OpenIDConnect.SessionID == "" {
+			userSession.OpenIDConnect.SessionID = ctx.Providers.Random.StringCustom(32, random.CharSetAlphaNumeric)
+		}
+
+		s.Claims.SessionID = userSession.OpenIDConnect.SessionID
+
+		userSession.AddOpenIDConnectLogoutClient(client.GetID(), s.Subject)
 	}
 
-	if !changed {
-		return
-	}
-
-	// Not fatal: the user still gets their tokens, the client just won't hear about this session ending.
+	// Not fatal: the user still gets their tokens, they just won't be revoked or announced when this session ends.
 	if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred saving the OpenID Connect 1.0 logout state for client with id '%s' to the user session", client.GetID())
 	}
@@ -157,19 +152,21 @@ const backChannelLogoutTimeout = 30 * time.Second
 // goBackChannelLogout runs Logout Token delivery off the request goroutine. Replaced in tests.
 var goBackChannelLogout = func(deliver func()) { go deliver() }
 
-// oauth2Logout ends the user's OpenID Connect 1.0 sessions alongside their Authelia session: every token issued to
-// the user is revoked, and each client given an ID Token in this session with a 'backchannel_logout_uri' is sent a
-// Logout Token. It must run before the user session is destroyed. Failures are logged and never block the logout.
+// oauth2Logout ends the OpenID Connect 1.0 grants of this user session alongside the session itself: every token
+// descended from an authorization made in this session is revoked, and each client given an ID Token in this session
+// with a 'backchannel_logout_uri' is sent a Logout Token. Grants from the user's other sessions, including
+// 'offline_access' ones, are left alone. It must run before the user session is destroyed. Failures are logged and
+// never block the logout.
 func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession) {
-	if ctx.Providers.OpenIDConnect == nil || userSession.Username == "" {
+	if ctx.Providers.OpenIDConnect == nil || userSession.Username == "" || userSession.OpenIDConnect == nil {
 		return
 	}
 
-	if err := ctx.Providers.StorageProvider.RevokeOAuth2SessionsByUsername(ctx, userSession.Username); err != nil {
+	if err := ctx.Providers.StorageProvider.RevokeOAuth2SessionsByRequestIDs(ctx, userSession.OpenIDConnect.RequestIDs); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of user '%s' during logout", userSession.Username)
 	}
 
-	if userSession.OpenIDConnect == nil || len(userSession.OpenIDConnect.Clients) == 0 {
+	if len(userSession.OpenIDConnect.Clients) == 0 {
 		return
 	}
 

@@ -4,10 +4,13 @@
 
 package session
 
-// authelia-plus: OpenID Connect Back-Channel Logout 1.0 session tracking.
+// authelia-plus: OpenID Connect 1.0 logout state.
 
-// OpenIDConnectLogout is the state needed to notify Relying Parties when this session ends.
+// OpenIDConnectLogout is the state needed to end this session's OpenID Connect 1.0 grants when the session ends.
 type OpenIDConnectLogout struct {
+	// RequestIDs are the authorization requests made in this session. Their tokens are revoked when it ends.
+	RequestIDs []string
+
 	// SessionID is the 'sid' claim issued to Back-Channel Logout clients for this session.
 	SessionID string
 

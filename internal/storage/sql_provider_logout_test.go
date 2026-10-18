@@ -7,35 +7,22 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/authelia/authelia/v4/internal/model"
 )
 
-// authelia-plus: tests for revoking a user's OAuth 2.0 sessions at logout.
+// authelia-plus: tests for revoking the OAuth 2.0 sessions of a logged out user session.
 
-func TestSQLProviderRevokeOAuth2SessionsByUsername(t *testing.T) {
+func TestSQLProviderRevokeOAuth2SessionsByRequestIDs(t *testing.T) {
 	provider := newTestSQLiteProviderWithEncryption(t)
 	require.NoError(t, provider.StartupCheck())
 
 	ctx := context.Background()
-
-	subjects := map[string]uuid.UUID{}
-
-	for _, username := range []string{"john", "harry"} {
-		subjects[username] = uuid.Must(uuid.NewRandom())
-
-		require.NoError(t, provider.SaveUserOpaqueIdentifier(ctx, model.UserOpaqueIdentifier{
-			Service:    "openid",
-			SectorID:   "",
-			Username:   username,
-			Identifier: subjects[username],
-		}))
-	}
 
 	types := []OAuth2SessionType{
 		OAuth2SessionTypeAccessToken,
@@ -44,39 +31,46 @@ func TestSQLProviderRevokeOAuth2SessionsByUsername(t *testing.T) {
 		OAuth2SessionTypeOpenIDConnect,
 	}
 
+	// Two rows per request and type, as refreshing leaves several tokens sharing one request ID.
 	for _, sessionType := range types {
-		for username, subject := range subjects {
-			require.NoError(t, provider.SaveOAuth2Session(ctx, sessionType, model.OAuth2Session{
-				ChallengeID:     model.MustNullUUID(model.NewRandomNullUUID()),
-				RequestID:       "req-" + username,
-				ClientID:        "test-client",
-				Signature:       "sig-" + username,
-				Subject:         sql.NullString{Valid: true, String: subject.String()},
-				Active:          true,
-				RequestedScopes: model.StringSlicePipeDelimited{"openid"},
-				GrantedScopes:   model.StringSlicePipeDelimited{"openid"},
-				Session:         []byte("{}"),
-			}))
+		for _, requestID := range []string{"req-a", "req-b", "req-other"} {
+			for i := range 2 {
+				require.NoError(t, provider.SaveOAuth2Session(ctx, sessionType, model.OAuth2Session{
+					ChallengeID:     model.MustNullUUID(model.NewRandomNullUUID()),
+					RequestID:       requestID,
+					ClientID:        "test-client",
+					Signature:       fmt.Sprintf("sig-%s-%d", requestID, i),
+					Subject:         sql.NullString{Valid: true, String: "c1b8b3a2-3f6e-4b51-9d0c-0d4f2b9a7e11"},
+					Active:          true,
+					RequestedScopes: model.StringSlicePipeDelimited{"openid"},
+					GrantedScopes:   model.StringSlicePipeDelimited{"openid"},
+					Session:         []byte("{}"),
+				}))
+			}
 		}
 	}
 
-	require.NoError(t, provider.RevokeOAuth2SessionsByUsername(ctx, "john"))
+	require.NoError(t, provider.RevokeOAuth2SessionsByRequestIDs(ctx, []string{"req-a", "req-b"}))
 
 	for _, sessionType := range types {
 		t.Run(sessionType.String(), func(t *testing.T) {
-			_, err := provider.LoadOAuth2Session(ctx, sessionType, "sig-john")
+			for i := range 2 {
+				for _, requestID := range []string{"req-a", "req-b"} {
+					_, err := provider.LoadOAuth2Session(ctx, sessionType, fmt.Sprintf("sig-%s-%d", requestID, i))
 
-			assert.ErrorIs(t, err, sql.ErrNoRows)
+					assert.ErrorIs(t, err, sql.ErrNoRows)
+				}
 
-			loaded, err := provider.LoadOAuth2Session(ctx, sessionType, "sig-harry")
+				loaded, err := provider.LoadOAuth2Session(ctx, sessionType, fmt.Sprintf("sig-req-other-%d", i))
 
-			require.NoError(t, err)
-			assert.Equal(t, subjects["harry"].String(), loaded.Subject.String)
+				require.NoError(t, err)
+				assert.Equal(t, "req-other", loaded.RequestID)
+			}
 		})
 	}
 
 	t.Run("ShouldBeIdempotent", func(t *testing.T) {
-		assert.NoError(t, provider.RevokeOAuth2SessionsByUsername(ctx, "john"))
-		assert.NoError(t, provider.RevokeOAuth2SessionsByUsername(ctx, "nobody"))
+		assert.NoError(t, provider.RevokeOAuth2SessionsByRequestIDs(ctx, []string{"req-a", "req-unknown"}))
+		assert.NoError(t, provider.RevokeOAuth2SessionsByRequestIDs(ctx, nil))
 	})
 }
