@@ -28,8 +28,8 @@ import (
 // The session is only ended when the request carries a valid 'id_token_hint' for the logged in user. The specification
 // expects the End-User to be asked to confirm a logout without one, as anyone can link a user agent here; until there
 // is a confirmation page such requests log nobody out. The user agent is sent to the requested
-// 'post_logout_redirect_uri' only when it validates against the client's registered URIs and the user is no longer
-// logged in, so the Relying Party never shows a logout that did not happen. Every other case goes to the portal,
+// 'post_logout_redirect_uri' only when it validates against the client's registered URIs and the user is known to be
+// logged out, so the Relying Party never shows a logout that did not happen. Every other case goes to the portal,
 // including invalid requests.
 //
 // https://openid.net/specs/openid-connect-rpinitiated-1_0.html
@@ -70,6 +70,8 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 
 			if err = ctx.DestroySession(); err != nil {
 				ctx.GetLogger().WithError(err).Errorf("End Session Request from client with id '%s' could not destroy the user session", clientID)
+
+				loggedIn = true
 			}
 
 			ctx.GetLogger().Debugf("End Session Request from client with id '%s' logged out user '%s'", clientID, userSession.Username)
