@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -438,6 +440,42 @@ func TestShouldProcessRevocationOnceAfterDelay(t *testing.T) {
 	assert.ErrorIs(t, b.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req3"}), ErrRecordUnavailable)
 }
 
+// Each claim is stamped when it's taken: a record claimed after a slow one must not carry the poll's start time, or
+// another instance would take it over while it's still being processed.
+func TestShouldStampEachClaimWhenTaken(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	first, second := testCreate(t, m), testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), first, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(time.Second))
+
+	_, err = m.Revoke(context.Background(), second, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	claimed := map[uuid.UUID]time.Time{}
+
+	m.SetProcessor(func(_ context.Context, record *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		claimed[record.ID] = store.Get(record.ID).ClaimedAt.Time
+
+		c.Set(c.Now().Add(ClaimLease + time.Minute))
+
+		return nil
+	})
+
+	start := c.Now().UTC()
+
+	m.Poll(context.Background())
+
+	require.Len(t, claimed, 2)
+	assert.Equal(t, start, claimed[first])
+	assert.Equal(t, start.Add(ClaimLease+time.Minute), claimed[second])
+}
+
 // A record whose grants can't be loaded is released for a retry rather than left claimed with its grants unrevoked.
 func TestShouldRetryRevocationWhenGrantsFailToLoad(t *testing.T) {
 	m, store, c := newTestManager(t, true)
@@ -704,6 +742,39 @@ func TestShouldRejectGrantForRevokedRecord(t *testing.T) {
 
 	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}), ErrRecordUnavailable)
 	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: uuid.New(), RequestID: "req1"}), ErrRecordUnavailable)
+}
+
+// A record holding the most grants refuses more, and the refusal is logged with the user so an administrator can see
+// why their authorizations fail.
+func TestShouldWarnWhenGrantCapIsHit(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	logger, hook := test.NewNullLogger()
+	m.SetLogger(logger)
+
+	id := testCreate(t, m)
+
+	store.Records[id].Grants = model.PlusUserSessionMaxGrants - 1
+
+	require.NoError(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}))
+	assert.Empty(t, hook.AllEntries())
+
+	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req2"}), ErrRecordUnavailable)
+
+	entry := hook.LastEntry()
+
+	require.NotNil(t, entry)
+	assert.Equal(t, logrus.WarnLevel, entry.Level)
+	assert.Contains(t, entry.Message, "'john'")
+
+	hook.Reset()
+
+	// Revoked by another instance, so this one's revoked set doesn't hold it yet.
+	_, err := store.RevokePlusUserSession(context.Background(), id, "john", RevokedBySelf, time.Now())
+	require.NoError(t, err)
+
+	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req3"}), ErrRecordUnavailable)
+	assert.Empty(t, hook.AllEntries(), "a revoked record isn't full")
 }
 
 func TestShouldThrottleAndBoundActivityWrites(t *testing.T) {

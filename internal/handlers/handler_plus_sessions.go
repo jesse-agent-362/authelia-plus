@@ -185,6 +185,12 @@ func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCooki
 
 	userSession.PlusID = id
 
+	// A re-authentication keeps the session's login time; a login, which starts a new session, or a switch of user
+	// doesn't.
+	if previous == uuid.Nil || previousUsername != username || userSession.PlusLoginTimestamp == 0 {
+		userSession.PlusLoginTimestamp = ctx.GetClock().Now().Unix()
+	}
+
 	return nil
 }
 

@@ -107,13 +107,17 @@ func (m *Manager) process(ctx context.Context, now time.Time) {
 	}
 
 	for _, id := range ids {
-		m.processOne(ctx, id, now)
+		m.processOne(ctx, id)
 	}
 }
 
-func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
+// processOne claims and processes one revocation. The claim is stamped when it's taken, not when the poll started:
+// a batch can run for longer than claimLease, and a claim stamped that late would be taken over while it's processed.
+func (m *Manager) processOne(ctx context.Context, id uuid.UUID) {
 	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
+
+	now := m.clock.Now().UTC()
 
 	if ok, err := m.store.ClaimPlusUserSession(pctx, id, now, now.Add(-claimLease)); err != nil || !ok {
 		if err != nil {

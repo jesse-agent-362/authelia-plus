@@ -7,6 +7,8 @@ package sessions
 import (
 	"context"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Poll runs one refresh, then one processing, of the background work.
@@ -23,6 +25,11 @@ func (m *Manager) Purge(ctx context.Context) {
 // Backoff is the wait before retrying a revocation after attempts failed attempts.
 func Backoff(attempts int) time.Duration {
 	return backoff(attempts)
+}
+
+// SetLogger sets the logger the manager logs to.
+func (m *Manager) SetLogger(logger *logrus.Logger) {
+	m.log = logrus.NewEntry(logger)
 }
 
 // SetPollInterval sets how often Run polls.

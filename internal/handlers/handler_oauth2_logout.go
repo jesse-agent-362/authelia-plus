@@ -98,9 +98,11 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 }
 
 // oauth2EndSessionHintMatches returns true when the request's validated 'id_token_hint' was issued to the logged in
-// user during this session: its subject belongs to the user, it was issued no earlier than the session's first factor,
-// and its 'sid', if any, is the session's. A hint from an earlier session, which any client holding an old ID Token
-// could replay, never ends a newer one. A Logout Token, which carries an 'events' claim, is never accepted as a hint.
+// user during this session: its subject belongs to the user, and either its 'sid' is the session's, or it has no 'sid'
+// and was issued no earlier than the user logged in to the session. That login time is not moved by a
+// re-authentication, so an ID Token from before a 'prompt=login' still logs out. A hint from an earlier session, which
+// any client holding an old ID Token could replay, never ends a newer one. A Logout Token, which carries an 'events'
+// claim, is never accepted as a hint.
 func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthelia2.RPInitiatedLogoutRequester, userSession *session.UserSession) bool {
 	claims := requester.GetIDTokenHintClaims()
 	if claims == nil {
@@ -111,13 +113,15 @@ func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthel
 		return false
 	}
 
-	iat, err := claims.GetIssuedAt()
-	if err != nil || iat == nil || iat.Unix() < userSession.FirstFactorAuthnTimestamp {
-		return false
-	}
-
-	if sid := requester.GetSessionID(); sid != "" && (userSession.OpenIDConnect == nil || sid != userSession.OpenIDConnect.SessionID) {
-		return false
+	if sid := requester.GetSessionID(); sid != "" {
+		if userSession.OpenIDConnect == nil || sid != userSession.OpenIDConnect.SessionID {
+			return false
+		}
+	} else {
+		iat, err := claims.GetIssuedAt()
+		if err != nil || iat == nil || iat.Unix() < userSession.PlusLoginTimestamp {
+			return false
+		}
 	}
 
 	subject, err := uuid.Parse(requester.GetSubject())

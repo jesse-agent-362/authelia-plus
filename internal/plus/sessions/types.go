@@ -57,7 +57,8 @@ const (
 	pollInterval = 10 * time.Second
 
 	// refreshOverlap is how far before the latest revocation seen a refresh starts. It covers a revocation committed
-	// late or stamped by a clock behind this one; every purgeInterval the whole retention is reloaded anyway.
+	// late or stamped by a clock behind this one; every purgeInterval the whole retention is reloaded anyway. Instances
+	// sharing a store need their clocks synchronized, with NTP or the like, to well within this.
 	refreshOverlap = 5 * time.Minute
 
 	// processDelay is how long a revocation waits before it's processed. Every instance has stopped accepting the

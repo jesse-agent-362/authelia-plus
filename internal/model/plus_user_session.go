@@ -41,8 +41,9 @@ type PlusUserSession struct {
 }
 
 // PlusUserSessionMaxGrants is the most grants a user session record takes. Revoking a session revokes all of its
-// grants at once, so this bounds the work one revocation can cause.
-const PlusUserSessionMaxGrants = 1000
+// grants at once, so this bounds the work one revocation can cause: 100 batched statements per table. It's well above
+// what a month of hourly silent renewals in a few tabs adds up to.
+const PlusUserSessionMaxGrants = 10000
 
 // PlusUserSessionRevocation is the ID and revocation time of a revoked user session record.
 type PlusUserSessionRevocation struct {

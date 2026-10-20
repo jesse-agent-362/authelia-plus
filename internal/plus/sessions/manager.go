@@ -229,10 +229,23 @@ func (m *Manager) RecordGrant(ctx context.Context, grant model.PlusUserSessionGr
 	}
 
 	if !ok {
+		m.warnIfFull(ctx, grant.SessionID)
+
 		return ErrRecordUnavailable
 	}
 
 	return nil
+}
+
+// warnIfFull logs a refused grant whose record is open but holds the most grants, as that fails every authorization of
+// the session until the user logs out.
+func (m *Manager) warnIfFull(ctx context.Context, id uuid.UUID) {
+	record, err := m.store.LoadPlusUserSession(ctx, id)
+	if err != nil || record == nil || record.RevokedAt.Valid || record.Grants < model.PlusUserSessionMaxGrants {
+		return
+	}
+
+	m.log.Warnf("The session of user '%s' holds the most OpenID Connect 1.0 grants a session can, %d, so its authorizations fail until the user logs out", record.Username, model.PlusUserSessionMaxGrants)
 }
 
 // End revokes the record of a session being logged out, and returns its grants for the caller to revoke right away.

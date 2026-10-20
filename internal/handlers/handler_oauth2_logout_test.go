@@ -21,6 +21,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"go.uber.org/mock/gomock"
 
+	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/mocks"
 	"github.com/authelia/authelia/v4/internal/oidc"
@@ -499,7 +500,7 @@ func TestOAuth2EndSession(t *testing.T) {
 		userSession, err := mock.Ctx.GetSession()
 		require.NoError(t, err)
 
-		userSession.FirstFactorAuthnTimestamp = time.Now().Add(time.Minute).Unix()
+		userSession.PlusLoginTimestamp = time.Now().Add(time.Minute).Unix()
 
 		require.NoError(t, mock.Ctx.SaveSession(userSession))
 
@@ -511,6 +512,63 @@ func TestOAuth2EndSession(t *testing.T) {
 		assert.Equal(t, http.StatusFound, code)
 		assert.Equal(t, testOIDCPortalURL, location)
 		assertLoggedIn(t, mock, true)
+	})
+
+	t.Run("ShouldLogoutWithIDTokenHintFromBeforeReauthentication", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		userSession.PlusLoginTimestamp = time.Now().Add(-time.Minute).Unix()
+		userSession.SetOneFactorReauthenticate(time.Now().Add(time.Minute), &authentication.UserDetails{Username: userSession.Username})
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			testOIDCFormParameterIDTokenHint:           []string{hint},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
+		assertLoggedIn(t, mock, false)
+	})
+
+	t.Run("ShouldLogoutWithIDTokenHintForThisSessionIDFromBeforeLogin", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		_, claims := mustDecodeTestJWT(t, hint)
+		require.NotEmpty(t, claims[oidc.ClaimSessionID])
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		userSession.PlusLoginTimestamp = time.Now().Add(time.Minute).Unix()
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assertLoggedIn(t, mock, false)
 	})
 
 	t.Run("ShouldNotLogoutWithIDTokenHintForAnotherSessionID", func(t *testing.T) {

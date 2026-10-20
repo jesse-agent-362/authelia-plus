@@ -56,6 +56,10 @@ type UserSession struct {
 
 	// PlusID is the ID of this session's record, which the user can list and revoke. authelia-plus.
 	PlusID uuid.UUID `json:",omitzero"`
+
+	// PlusLoginTimestamp is when the user logged in to this session. Unlike FirstFactorAuthnTimestamp, a
+	// re-authentication doesn't move it. authelia-plus.
+	PlusLoginTimestamp int64 `json:",omitempty"`
 }
 
 // TOTP holds the TOTP registration session data.

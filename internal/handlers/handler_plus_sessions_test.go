@@ -183,6 +183,41 @@ func TestPlusSessionsFirstFactorPassword(t *testing.T) {
 		assert.True(t, old.ProcessedAt.Valid, "a replaced record must never reach the processor")
 		assert.Equal(t, plussessions.RevokedByReplace, old.RevokedBy)
 	})
+
+	t.Run("ShouldKeepLoginTimeOnReauthenticationOnly", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtx(t)
+		defer mock.Close()
+
+		mock.Ctx.Providers.Clock = &mock.Clock
+
+		expectTestPlusPasswordSuccess(mock)
+
+		before := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, mock.Clock.Now().Unix(), before.PlusLoginTimestamp)
+
+		mock.Clock.Set(mock.Clock.Now().Add(time.Hour))
+
+		mock.Ctx.Response.Reset()
+		mock.Ctx.Request.SetBodyString(`{"password":"hello"}`)
+
+		FirstFactorReauthenticatePOST(nil)(mock.Ctx)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+
+		reauthenticated, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		assert.Equal(t, mock.Clock.Now().Unix(), reauthenticated.FirstFactorAuthnTimestamp)
+		assert.Equal(t, before.PlusLoginTimestamp, reauthenticated.PlusLoginTimestamp, "re-authentication must not move the login time")
+
+		mock.Clock.Set(mock.Clock.Now().Add(time.Hour))
+
+		after := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.Equal(t, mock.Clock.Now().Unix(), after.PlusLoginTimestamp, "a login moves the login time")
+	})
 }
 
 func TestPlusSessionsGET(t *testing.T) {
