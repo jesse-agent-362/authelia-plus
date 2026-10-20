@@ -30,6 +30,7 @@ func (m *Manager) Retention() time.Duration {
 }
 
 const (
+	ClaimLease    = claimLease
 	ProcessDelay  = processDelay
 	TouchInterval = touchInterval
 	WriteQueue    = writeQueue

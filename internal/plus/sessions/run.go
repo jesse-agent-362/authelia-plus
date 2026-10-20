@@ -89,12 +89,13 @@ func (m *Manager) poll(ctx context.Context) {
 }
 
 // process performs the side effects of the revocations older than processDelay. Each record is claimed first, so with
-// several instances exactly one processes it; a failed one is released again to be retried on the next poll.
+// several instances one processes it at a time; a failed one is released again to be retried on the next poll, and
+// one whose instance stopped mid-processing is taken over once its claim is older than claimLease.
 func (m *Manager) process(ctx context.Context, now time.Time) {
 	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
-	ids, err := m.store.LoadPlusUserSessionUnprocessedIDs(pctx, now.Add(-processDelay), processBatch)
+	ids, err := m.store.LoadPlusUserSessionUnprocessedIDs(pctx, now.Add(-processDelay), now.Add(-claimLease), processBatch)
 	if err != nil {
 		m.log.WithError(err).Error("Error occurred loading the revoked user sessions to process")
 
@@ -110,7 +111,7 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
-	if ok, err := m.store.ClaimPlusUserSession(pctx, id, now); err != nil || !ok {
+	if ok, err := m.store.ClaimPlusUserSession(pctx, id, now, now.Add(-claimLease)); err != nil || !ok {
 		if err != nil {
 			m.log.WithError(err).Errorf("Error occurred claiming the revoked user session '%s'", id)
 		}
@@ -123,7 +124,7 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	if err != nil || record == nil {
 		m.log.WithError(err).Errorf("Error occurred loading the revoked user session '%s', it will be retried", id)
 
-		m.unclaim(ctx, id)
+		m.unclaim(id)
 
 		return
 	}
@@ -132,19 +133,28 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	if err != nil {
 		m.log.WithError(err).Errorf("Error occurred loading the grants of the revoked user session '%s', it will be retried", id)
 
-		m.unclaim(ctx, id)
+		m.unclaim(id)
 
 		return
 	}
 
-	if m.processor == nil {
-		return
+	if m.processor != nil {
+		if err = m.processor(ctx, record, grants); err != nil {
+			m.log.WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 grants of the revoked user session '%s', it will be retried", id)
+
+			m.unclaim(id)
+
+			return
+		}
 	}
 
-	if err = m.processor(ctx, record, grants); err != nil {
-		m.log.WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 grants of the revoked user session '%s', it will be retried", id)
+	// Detached from ctx, which is done at shutdown: a revocation processed then is still marked so. Should this fail,
+	// the claim lapses and the revocation is processed again, which is harmless.
+	cctx, ccancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer ccancel()
 
-		m.unclaim(ctx, id)
+	if err = m.store.CompletePlusUserSession(cctx, id, m.clock.Now().UTC()); err != nil {
+		m.log.WithError(err).Errorf("Error occurred marking the revoked user session '%s' as processed, it will be processed again", id)
 
 		return
 	}
@@ -152,8 +162,10 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	m.log.Debugf("Processed the revocation of the user session '%s' of user '%s'", id, record.Username)
 }
 
-func (m *Manager) unclaim(ctx context.Context, id uuid.UUID) {
-	uctx, cancel := context.WithTimeout(ctx, storeTimeout)
+// unclaim releases a claim for the next poll to retry. It's detached from ctx, which is done at shutdown; should it
+// fail anyway, the claim lapses after claimLease.
+func (m *Manager) unclaim(id uuid.UUID) {
+	uctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
 	if err := m.store.UnclaimPlusUserSession(uctx, id); err != nil {

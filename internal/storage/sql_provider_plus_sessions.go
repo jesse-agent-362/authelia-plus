@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     grants INTEGER NOT NULL DEFAULT 0,
     revoked_at DATETIME NULL DEFAULT NULL,
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
+    claimed_at DATETIME NULL DEFAULT NULL,
     processed_at DATETIME NULL DEFAULT NULL
 );`
 
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     grants INTEGER NOT NULL DEFAULT 0,
     revoked_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL,
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
+    claimed_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL,
     processed_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL
 );`
 
@@ -81,11 +83,13 @@ CREATE TABLE IF NOT EXISTS plus_user_session_grant (
 );`
 
 	// The username is compared exactly on every dialect: the case insensitive collation MySQL would otherwise use
-	// could let one user list and revoke the sessions of another whose username differs only in case.
+	// could let one user list and revoke the sessions of another whose username differs only in case. It's binary
+	// rather than utf8mb4_bin, which pads, so 'john ' would equal 'john'; MariaDB has no collation without padding
+	// that MySQL shares.
 	queryPlusUserSessionCreateMySQL = `
 CREATE TABLE IF NOT EXISTS plus_user_session (
     id CHAR(36) NOT NULL PRIMARY KEY,
-    username VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    username VARBINARY(400) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_active TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     grants INTEGER NOT NULL DEFAULT 0,
     revoked_at TIMESTAMP NULL DEFAULT NULL,
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
+    claimed_at TIMESTAMP NULL DEFAULT NULL,
     processed_at TIMESTAMP NULL DEFAULT NULL,
     INDEX plus_user_session_username (username),
     INDEX plus_user_session_revoked_at (revoked_at)
@@ -113,7 +118,7 @@ CREATE TABLE IF NOT EXISTS plus_user_session_grant (
 	queryPlusUserSessionCreateIndexUsername  = `CREATE INDEX IF NOT EXISTS plus_user_session_username ON plus_user_session (username);`
 	queryPlusUserSessionCreateIndexRevokedAt = `CREATE INDEX IF NOT EXISTS plus_user_session_revoked_at ON plus_user_session (revoked_at);`
 
-	queryPlusUserSessionColumns = `id, username, created_at, last_active, expires_at, ip, user_agent, grants, revoked_at, revoked_by, processed_at`
+	queryPlusUserSessionColumns = `id, username, created_at, last_active, expires_at, ip, user_agent, grants, revoked_at, revoked_by, claimed_at, processed_at`
 
 	queryPlusUserSessionInsert = `
 INSERT INTO plus_user_session (id, username, created_at, last_active, expires_at, ip, user_agent)
@@ -133,7 +138,7 @@ SET last_active = ?, expires_at = ?
 WHERE id = ? AND revoked_at IS NULL;`
 
 	// queryPlusUserSessionLockForGrant always changes the row when it matches, so every dialect reports it affected,
-	// and it holds the row lock until the grant is inserted: a claim either sees the grant or the insert fails.
+	// and it holds the row lock until the grant is inserted: a revoke either waits for the grant or the insert fails.
 	queryPlusUserSessionLockForGrant = `
 UPDATE plus_user_session
 SET grants = grants + 1
@@ -167,17 +172,17 @@ SET revoked_at = ?, revoked_by = ?, processed_at = ?
 WHERE revoked_at IS NULL;`
 
 	// queryPlusUserSessionReplaceClose closes the record a re-authentication replaces. It only matches a record nobody
-	// revoked or claimed, so a revoke racing the re-authentication can't be escaped.
+	// revoked, so a revoke racing the re-authentication can't be escaped.
 	queryPlusUserSessionReplaceClose = `
 UPDATE plus_user_session
 SET revoked_at = ?, revoked_by = ?, processed_at = ?
 WHERE id = ? AND username = ? AND revoked_at IS NULL AND processed_at IS NULL;`
 
-	// queryPlusUserSessionEnd claims a record for its own logout, revoking it unless it already was. MySQL evaluates SET
-	// assignments left to right, so revoked_by is assigned before revoked_at changes.
-	queryPlusUserSessionEnd = `
-UPDATE plus_user_session
-SET revoked_by = CASE WHEN revoked_at IS NULL THEN ? ELSE revoked_by END, revoked_at = COALESCE(revoked_at, ?), processed_at = ?
+	// queryPlusUserSessionEndCheck finds whether a logout has anything left to revoke: the record is ended with the
+	// plain revoke, which leaves the processing to the poller.
+	queryPlusUserSessionEndCheck = `
+SELECT COUNT(id)
+FROM plus_user_session
 WHERE id = ? AND username = ? AND processed_at IS NULL;`
 
 	queryPlusUserSessionSelectRevokedIDs = `SELECT id FROM plus_user_session WHERE revoked_at IS NOT NULL AND revoked_at > ?;`
@@ -185,17 +190,26 @@ WHERE id = ? AND username = ? AND processed_at IS NULL;`
 	queryPlusUserSessionSelectUnprocessedIDs = `
 SELECT id
 FROM plus_user_session
-WHERE revoked_at IS NOT NULL AND revoked_at <= ? AND processed_at IS NULL
+WHERE revoked_at IS NOT NULL AND revoked_at <= ? AND processed_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?)
 ORDER BY revoked_at
 LIMIT ?;`
 
-	queryPlusUserSessionClaim = `UPDATE plus_user_session SET processed_at = ? WHERE id = ? AND processed_at IS NULL;`
+	// queryPlusUserSessionClaim leases a revoked record to one instance. A lease older than the cutoff is taken over,
+	// so a record whose instance died or shut down mid-processing is processed anyway.
+	queryPlusUserSessionClaim = `
+UPDATE plus_user_session
+SET claimed_at = ?
+WHERE id = ? AND revoked_at IS NOT NULL AND processed_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?);`
 
-	queryPlusUserSessionUnclaim = `UPDATE plus_user_session SET processed_at = NULL WHERE id = ?;`
+	queryPlusUserSessionComplete = `UPDATE plus_user_session SET processed_at = ?, claimed_at = NULL WHERE id = ? AND processed_at IS NULL;`
 
+	queryPlusUserSessionUnclaim = `UPDATE plus_user_session SET claimed_at = NULL WHERE id = ? AND processed_at IS NULL;`
+
+	// queryPlusUserSessionPurge never deletes a revoked record before it is processed: its grants' tokens can outlive
+	// the retention.
 	queryPlusUserSessionPurge = `
 DELETE FROM plus_user_session
-WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR (revoked_at IS NULL AND expires_at < ?);`
+WHERE (revoked_at IS NOT NULL AND revoked_at < ? AND processed_at IS NOT NULL) OR (revoked_at IS NULL AND expires_at < ?);`
 
 	queryPlusUserSessionGrantPurge = `
 DELETE FROM plus_user_session_grant
@@ -268,8 +282,8 @@ func (p *SQLProvider) UpdatePlusUserSessionActivity(ctx context.Context, id uuid
 	return nil
 }
 
-// SavePlusUserSessionGrant adds a grant to a user session record. It reports false when the record is missing, revoked
-// or claimed, as the grant would then never be revoked; the caller must not issue it.
+// SavePlusUserSessionGrant adds a grant to a user session record. It reports false when the record is missing or
+// revoked, as the grant could then be missed by the revocation; the caller must not issue it.
 func (p *SQLProvider) SavePlusUserSessionGrant(ctx context.Context, grant model.PlusUserSessionGrant) (ok bool, err error) {
 	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
 		var result sql.Result
@@ -305,7 +319,7 @@ func (p *SQLProvider) LoadPlusUserSessionGrants(ctx context.Context, id uuid.UUI
 
 // ReplacePlusUserSession atomically closes the previous record of a session, without side effects, inserts its
 // replacement and moves the previous record's grants to it. It reports false, changing nothing, unless the previous
-// record belongs to the replacement's user and was neither revoked nor claimed.
+// record belongs to the replacement's user and was not revoked.
 func (p *SQLProvider) ReplacePlusUserSession(ctx context.Context, previous uuid.UUID, s model.PlusUserSession, revokedBy string) (ok bool, err error) {
 	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
 		var result sql.Result
@@ -370,17 +384,29 @@ func (p *SQLProvider) ClosePlusUserSessions(ctx context.Context, revokedBy strin
 	return result.RowsAffected()
 }
 
-// EndPlusUserSession claims a user session record of username for its logout, revoking it if it wasn't already. It
-// reports false when the record is missing or another logout or instance claimed it first; the caller must then leave
-// its grants alone.
+// EndPlusUserSession revokes a user session record of username for its logout, if it wasn't already. It reports false
+// when the record is missing or its revocation was processed already.
 func (p *SQLProvider) EndPlusUserSession(ctx context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (ok bool, err error) {
-	var result sql.Result
+	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
+		if _, err = tx.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionRevoke), now, revokedBy, id, username); err != nil {
+			return err
+		}
 
-	if result, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionEnd), revokedBy, now, now, id, username); err != nil {
+		var count int
+
+		if err = tx.GetContext(ctx, &count, p.db.Rebind(queryPlusUserSessionEndCheck), id, username); err != nil {
+			return err
+		}
+
+		ok = count == 1
+
+		return nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("error ending user session record '%s': %w", id, err)
 	}
 
-	return plusRowsAffected(result)
+	return ok, nil
 }
 
 // LoadPlusUserSessionRevokedIDs loads the IDs of the user session records revoked after since.
@@ -393,28 +419,39 @@ func (p *SQLProvider) LoadPlusUserSessionRevokedIDs(ctx context.Context, since t
 }
 
 // LoadPlusUserSessionUnprocessedIDs loads up to limit IDs of the user session records revoked no later than before
-// whose revocation has not been processed, oldest revocation first.
-func (p *SQLProvider) LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before time.Time, limit int) (ids []uuid.UUID, err error) {
-	if err = p.db.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectUnprocessedIDs), before, limit); err != nil {
+// whose revocation has not been processed, and which are unclaimed or were claimed before leaseBefore, oldest
+// revocation first.
+func (p *SQLProvider) LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before, leaseBefore time.Time, limit int) (ids []uuid.UUID, err error) {
+	if err = p.db.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectUnprocessedIDs), before, leaseBefore, limit); err != nil {
 		return nil, fmt.Errorf("error selecting unprocessed user session records: %w", err)
 	}
 
 	return ids, nil
 }
 
-// ClaimPlusUserSession marks the revocation of a user session record as processed. It reports false when another
-// instance already did, in which case the caller must not process it.
-func (p *SQLProvider) ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) (ok bool, err error) {
+// ClaimPlusUserSession leases the revocation of a user session record for processing. It reports false when it's
+// processed, or another instance holds a lease taken at or after leaseBefore, in which case the caller must not
+// process it.
+func (p *SQLProvider) ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now, leaseBefore time.Time) (ok bool, err error) {
 	var result sql.Result
 
-	if result, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionClaim), now, id); err != nil {
+	if result, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionClaim), now, id, leaseBefore); err != nil {
 		return false, fmt.Errorf("error claiming user session record '%s': %w", id, err)
 	}
 
 	return plusRowsAffected(result)
 }
 
-// UnclaimPlusUserSession marks the revocation of a user session record as unprocessed again, so it's retried.
+// CompletePlusUserSession marks the revocation of a user session record as processed.
+func (p *SQLProvider) CompletePlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) (err error) {
+	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionComplete), now, id); err != nil {
+		return fmt.Errorf("error completing user session record '%s': %w", id, err)
+	}
+
+	return nil
+}
+
+// UnclaimPlusUserSession releases the lease on the revocation of a user session record, so it's retried.
 func (p *SQLProvider) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID) (err error) {
 	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionUnclaim), id); err != nil {
 		return fmt.Errorf("error unclaiming user session record '%s': %w", id, err)
@@ -423,7 +460,7 @@ func (p *SQLProvider) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID) 
 	return nil
 }
 
-// PurgePlusUserSessions deletes the user session records revoked before revokedBefore, the unrevoked ones which
+// PurgePlusUserSessions deletes the processed user session records revoked before revokedBefore, the unrevoked ones which
 // expired before expiredBefore, and the grants of deleted records.
 func (p *SQLProvider) PurgePlusUserSessions(ctx context.Context, revokedBefore, expiredBefore time.Time) (err error) {
 	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionPurge), revokedBefore, expiredBefore); err != nil {

@@ -204,9 +204,10 @@ var goBackChannelLogout = func(deliver func()) { go deliver() }
 // 'offline_access' ones, are left alone. It must run before the user session is destroyed. Failures are logged and
 // never block the logout.
 //
-// The grants come from the session's record, which the logout also closes. Should that fail, the session's own copy
-// is used instead: a record that was closed is released for the revocation to be processed in the background, and one
-// that wasn't stays open until it expires, its session destroyed by the logout regardless.
+// The grants come from the session's record, which the logout revokes. Revoking them here is best effort: the
+// revocation is processed in the background as well, which revokes them again and makes good a failure here. Should
+// revoking the record fail, the session's own copy of its grants is used instead; the record then stays open until it
+// expires, its session destroyed by the logout regardless.
 func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession) {
 	if userSession.Username == "" {
 		return
@@ -226,7 +227,7 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 
 			grants = oauth2LogoutSessionGrants(userSession)
 		case !ok:
-			// Already claimed: the revocation of this session is being processed elsewhere.
+			// Already processed: the grants were revoked.
 			return
 		}
 	} else {

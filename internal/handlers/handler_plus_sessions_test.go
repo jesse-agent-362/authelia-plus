@@ -412,12 +412,46 @@ func TestPlusSessionsLogout(t *testing.T) {
 
 		require.NotNil(t, record)
 		assert.True(t, record.RevokedAt.Valid)
-		assert.True(t, record.ProcessedAt.Valid, "the processor must not revoke the grants again")
+		assert.False(t, record.ProcessedAt.Valid, "the poller revokes the grants again")
 		assert.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
 		assert.True(t, mock.Ctx.Providers.PlusSessions.Revoked(userSession.PlusID))
 	})
 
-	t.Run("ShouldNotRevokeGrantsOfClaimedRecord", func(t *testing.T) {
+	// Item 1: a failed revoke at logout only logs; the record stays for the poller, whose processor revokes the grants.
+	t.Run("ShouldLeaveFailedRevokeToThePoller", func(t *testing.T) {
+		mock, userSession := setup(t)
+		defer mock.Close()
+
+		ok, err := mock.PlusSessionsStore.SavePlusUserSessionGrant(mock.Ctx, model.PlusUserSessionGrant{SessionID: userSession.PlusID, RequestID: "request-id"})
+
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		gomock.InOrder(
+			mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"request-id"}).Return(errors.New("database is locked")),
+			mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"request-id"}).Return(nil),
+		)
+
+		oauth2Logout(mock.Ctx, &userSession)
+
+		now := mock.Clock.Now().UTC().Add(time.Minute)
+
+		ids, err := mock.PlusSessionsStore.LoadPlusUserSessionUnprocessedIDs(mock.Ctx, now, now, 10)
+
+		require.NoError(t, err)
+		require.Equal(t, []uuid.UUID{userSession.PlusID}, ids, "the revocation is left for the poller")
+
+		record := mock.PlusSessionsStore.Get(userSession.PlusID)
+		grants, err := mock.PlusSessionsStore.LoadPlusUserSessionGrants(mock.Ctx, userSession.PlusID)
+
+		require.NoError(t, err)
+
+		processor := NewPlusSessionsProcessor(&mock.Ctx.Providers, &mock.Ctx.Configuration, mock.Ctx.Logger)
+
+		require.NoError(t, processor(mock.Ctx, record, grants))
+	})
+
+	t.Run("ShouldNotRevokeGrantsOfProcessedRecord", func(t *testing.T) {
 		mock, userSession := setup(t)
 		defer mock.Close()
 

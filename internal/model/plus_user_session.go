@@ -28,8 +28,11 @@ type PlusUserSession struct {
 	// the record against a concurrent claim.
 	Grants int `db:"grants"`
 
-	RevokedAt   sql.NullTime `db:"revoked_at"`
-	RevokedBy   string       `db:"revoked_by"`
+	RevokedAt sql.NullTime `db:"revoked_at"`
+	RevokedBy string       `db:"revoked_by"`
+
+	// ClaimedAt is when an instance leased the revocation for processing; ProcessedAt is when it finished.
+	ClaimedAt   sql.NullTime `db:"claimed_at"`
 	ProcessedAt sql.NullTime `db:"processed_at"`
 }
 

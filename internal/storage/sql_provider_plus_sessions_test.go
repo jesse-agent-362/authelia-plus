@@ -82,12 +82,13 @@ func newTestPlusProviders(t *testing.T) map[string]*SQLProvider {
 
 		ctx := context.Background()
 
-		require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
-
+		// Dropped rather than emptied, so a schema change is picked up.
 		for _, table := range []string{tablePlusUserSessionGrant, tablePlusUserSession} {
-			_, err = provider.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s;", table))
+			_, err = provider.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s;", table))
 			require.NoError(t, err)
 		}
+
+		require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
 
 		providers[name] = provider
 	}
@@ -110,10 +111,11 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx), "creating the tables must be idempotent")
 
 	now := time.Unix(1760000000, 0).UTC()
+	lease := now.Add(-5 * time.Minute)
 
-	john, johnOther, johnCased, harry := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "John", now), newTestPlusUserSession(t, "harry", now)
+	john, johnOther, johnCased, johnPadded, harry := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "John", now), newTestPlusUserSession(t, "john ", now), newTestPlusUserSession(t, "harry", now)
 
-	for _, s := range []model.PlusUserSession{john, johnOther, johnCased, harry} {
+	for _, s := range []model.PlusUserSession{john, johnOther, johnCased, johnPadded, harry} {
 		require.NoError(t, provider.SavePlusUserSession(ctx, s))
 	}
 
@@ -123,7 +125,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 
 	sessions, err := provider.LoadPlusUserSessionsActive(ctx, "john", now)
 	require.NoError(t, err)
-	require.Len(t, sessions, 2, "usernames are matched exactly, so 'John' is someone else")
+	require.Len(t, sessions, 2, "usernames are matched exactly, so 'John' and 'john ' are someone else")
 	assert.Equal(t, johnOther.ID, sessions[0].ID, "most recently active first")
 	assert.Equal(t, john.ID, sessions[1].ID)
 
@@ -153,6 +155,10 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.False(t, ok, "a username differing only in case is another user")
 
+	ok, err = provider.RevokePlusUserSession(ctx, johnPadded.ID, "john", "self", now)
+	require.NoError(t, err)
+	assert.False(t, ok, "a username differing only in trailing spaces is another user")
+
 	ok, err = provider.RevokePlusUserSession(ctx, uuid.New(), "john", "self", now)
 	require.NoError(t, err)
 	assert.False(t, ok)
@@ -177,21 +183,46 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{john.ID}, ids)
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now.Add(-time.Second), 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now.Add(-time.Second), lease, 10)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "too recent to process")
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{john.ID}, ids)
 
-	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now)
+	ok, err = provider.ClaimPlusUserSession(ctx, johnOther.ID, now, lease)
+	require.NoError(t, err)
+	assert.False(t, ok, "an unrevoked record can't be claimed")
+
+	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now, lease)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
-	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now)
+	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now, lease)
 	require.NoError(t, err)
-	assert.False(t, ok, "a record is claimed once")
+	assert.False(t, ok, "a claim is held for the lease")
+
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
+	require.NoError(t, err)
+	assert.Empty(t, ids, "a claimed record isn't offered while the lease holds")
+
+	// Item 2: an instance that stopped mid-processing never completes or releases its claim; once the lease lapses
+	// the record is offered and claimed again.
+	later := now.Add(6 * time.Minute)
+
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later.Add(-5*time.Minute), 10)
+	require.NoError(t, err)
+	assert.Equal(t, []uuid.UUID{john.ID}, ids)
+
+	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, later, later.Add(-5*time.Minute))
+	require.NoError(t, err)
+	assert.True(t, ok, "a lapsed claim is taken over")
+
+	record, err = provider.LoadPlusUserSession(ctx, john.ID)
+	require.NoError(t, err)
+	assert.True(t, record.ClaimedAt.Valid)
+	assert.False(t, record.ProcessedAt.Valid, "a claim alone isn't processing")
 
 	grants, err := provider.LoadPlusUserSessionGrants(ctx, john.ID)
 	require.NoError(t, err)
@@ -207,9 +238,28 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 
 	require.NoError(t, provider.UnclaimPlusUserSession(ctx, john.ID))
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
 	require.NoError(t, err)
-	assert.Equal(t, []uuid.UUID{john.ID}, ids)
+	assert.Equal(t, []uuid.UUID{john.ID}, ids, "a released record is offered again at once")
+
+	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now, lease)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	require.NoError(t, provider.CompletePlusUserSession(ctx, john.ID, now))
+
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later, 10)
+	require.NoError(t, err)
+	assert.Empty(t, ids, "a processed record is never offered again")
+
+	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, later, later)
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	record, err = provider.LoadPlusUserSession(ctx, john.ID)
+	require.NoError(t, err)
+	assert.True(t, record.ProcessedAt.Valid)
+	assert.False(t, record.ClaimedAt.Valid)
 
 	count, err := provider.RevokePlusUserSessionsByUsername(ctx, "JOHN", "cli", now)
 	require.NoError(t, err)
@@ -237,22 +287,33 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 			ok, err = provider.EndPlusUserSession(ctx, id, "harry", "logout", now)
 			require.NoError(t, err)
 			assert.True(t, ok)
-
-			ok, err = provider.EndPlusUserSession(ctx, id, "harry", "logout", now)
-			require.NoError(t, err)
-			assert.False(t, ok, "a record is claimed once")
 		}
 
+		ok, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: fresh.ID, RequestID: "after-end"})
+		require.NoError(t, err)
+		assert.False(t, ok, "an ended record takes no grant")
+
+		// Item 1: ending doesn't claim, so the poller still processes the revocation after the logout's own attempt.
 		record, err := provider.LoadPlusUserSession(ctx, fresh.ID)
 		require.NoError(t, err)
 		assert.True(t, record.RevokedAt.Valid)
-		assert.True(t, record.ProcessedAt.Valid)
+		assert.False(t, record.ProcessedAt.Valid)
+		assert.False(t, record.ClaimedAt.Valid)
 		assert.Equal(t, "logout", record.RevokedBy)
+
+		ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 100)
+		require.NoError(t, err)
+		assert.Contains(t, ids, fresh.ID)
 
 		record, err = provider.LoadPlusUserSession(ctx, revoked.ID)
 		require.NoError(t, err)
-		assert.True(t, record.ProcessedAt.Valid)
 		assert.Equal(t, "self", record.RevokedBy, "an earlier revoke keeps its attribution")
+
+		require.NoError(t, provider.CompletePlusUserSession(ctx, fresh.ID, now))
+
+		ok, err = provider.EndPlusUserSession(ctx, fresh.ID, "harry", "logout", now)
+		require.NoError(t, err)
+		assert.False(t, ok, "a processed record has nothing left to end")
 	})
 
 	t.Run("Replace", func(t *testing.T) {
@@ -315,7 +376,11 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 
 	count, err = provider.ClosePlusUserSessions(ctx, "restart", now)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), count, "johnCased, harry and the restart record")
+	assert.Equal(t, int64(4), count, "johnCased, johnPadded, harry and the restart record")
+
+	// johnOther was revoked by the CLI and never processed.
+	_, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: johnOther.ID, RequestID: "unprocessed"})
+	require.NoError(t, err)
 
 	require.NoError(t, provider.PurgePlusUserSessions(ctx, now.Add(time.Second), now))
 
@@ -326,11 +391,18 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	grants, err = provider.LoadPlusUserSessionGrants(ctx, john.ID)
 	require.NoError(t, err)
 	assert.Empty(t, grants, "the grants of purged records are purged")
+
+	// Item 3: a revoked record that was never processed is kept, grants and all, however old.
+	record, err = provider.LoadPlusUserSession(ctx, johnOther.ID)
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	assert.False(t, record.ProcessedAt.Valid)
 }
 
-// TestSQLProviderPlusUserSessionGrantsConcurrent checks that grants recorded concurrently in
-// one session, while the session's revocation is claimed, are never lost. Every grant reported saved must be among the
-// grants loaded after the claim, which are the ones the revocation acts on.
+// TestSQLProviderPlusUserSessionGrantsConcurrent checks that grants recorded concurrently in one session, while the
+// session is revoked, are never lost. Every grant reported saved must be among the grants loaded after the revoke,
+// which are the ones a logout or the poller acts on. On SQLite, which serializes writers, this can't tell the row lock
+// apart from a check-then-insert; the MySQL and PostgreSQL runs are the real proof.
 func TestSQLProviderPlusUserSessionGrantsConcurrent(t *testing.T) {
 	for name, provider := range newTestPlusProviders(t) {
 		t.Run(name, func(t *testing.T) {
@@ -349,14 +421,14 @@ func TestSQLProviderPlusUserSessionGrantsConcurrent(t *testing.T) {
 				wg      sync.WaitGroup
 				mu      sync.Mutex
 				saved   = map[string]bool{}
-				claimed = make(chan struct{})
+				revoked = make(chan struct{})
 			)
 
 			for w := range workers {
 				wg.Go(func() {
 					for i := range perWorker {
 						if w == 0 && i == perWorker/2 {
-							close(claimed)
+							close(revoked)
 						}
 
 						id := fmt.Sprintf("w%d-%d", w, i)
@@ -371,14 +443,14 @@ func TestSQLProviderPlusUserSessionGrantsConcurrent(t *testing.T) {
 				})
 			}
 
-			<-claimed
+			<-revoked
 
 			var ok bool
 
 			for {
 				var err error
 
-				if ok, err = provider.ClaimPlusUserSession(ctx, record.ID, now); err == nil {
+				if ok, err = provider.RevokePlusUserSession(ctx, record.ID, "john", "self", now); err == nil {
 					break
 				}
 			}
@@ -407,7 +479,7 @@ func TestSQLProviderPlusUserSessionGrantsConcurrent(t *testing.T) {
 
 			after, err := provider.LoadPlusUserSessionGrants(ctx, record.ID)
 			require.NoError(t, err)
-			assert.Len(t, after, len(grants), "no grant is added after the claim")
+			assert.Len(t, after, len(grants), "no grant is added after the revoke")
 		})
 	}
 }

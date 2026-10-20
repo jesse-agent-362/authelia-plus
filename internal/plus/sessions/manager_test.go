@@ -168,8 +168,18 @@ func TestShouldRevokePreviousRecordOnUserSwitch(t *testing.T) {
 	assert.Equal(t, "harry", store.Get(id).Username)
 }
 
+// Item 1: the logout's own revoke of the grants is best effort; the poller processes the revocation afterwards anyway,
+// so a revoke that failed, or ran before a racing authorization stored its code, is made good.
 func TestShouldEndRecordOnLogout(t *testing.T) {
-	m, store, _ := newTestManager(t, true)
+	m, store, c := newTestManager(t, true)
+
+	var got [][]model.PlusUserSessionGrant
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, grants []model.PlusUserSessionGrant) error {
+		got = append(got, grants)
+
+		return nil
+	})
 
 	id := testCreate(t, m)
 
@@ -182,16 +192,25 @@ func TestShouldEndRecordOnLogout(t *testing.T) {
 
 	record := store.Get(id)
 	assert.Equal(t, RevokedByLogout, record.RevokedBy)
-	assert.True(t, record.ProcessedAt.Valid, "the logout acts on the grants itself")
+	assert.False(t, record.ProcessedAt.Valid, "the poller still processes it")
 	assert.True(t, m.Revoked(id))
+
+	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req2"}), ErrRecordUnavailable)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, [][]model.PlusUserSessionGrant{{{SessionID: id, RequestID: "req1"}}}, got)
+	assert.True(t, store.Get(id).ProcessedAt.Valid)
 
 	_, ok, err = m.End(context.Background(), id, "john")
 	require.NoError(t, err)
-	assert.False(t, ok, "a second logout leaves the grants alone")
+	assert.False(t, ok, "a processed record has nothing left for a logout")
 }
 
-// A logout which can't load the grants releases the record, so the revocation is processed in the background.
-func TestShouldReleaseRecordWhenEndCannotLoadGrants(t *testing.T) {
+// A logout which can't load the grants leaves the revocation to be processed in the background.
+func TestShouldLeaveRecordToPollerWhenEndCannotLoadGrants(t *testing.T) {
 	m, store, _ := newTestManager(t, true)
 
 	id := testCreate(t, m)
@@ -442,7 +461,8 @@ func TestShouldRetryRevocationWhenGrantsFailToLoad(t *testing.T) {
 	m.Poll(context.Background())
 
 	assert.Equal(t, int32(0), calls.Load())
-	assert.False(t, store.Get(id).ProcessedAt.Valid, "the claim is released")
+	assert.False(t, store.Get(id).ProcessedAt.Valid)
+	assert.False(t, store.Get(id).ClaimedAt.Valid, "the claim is released")
 
 	store.SetError("LoadPlusUserSessionGrants", nil)
 
@@ -477,6 +497,84 @@ func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
 	m.Poll(context.Background())
 
 	assert.Equal(t, int32(2), calls.Load())
+}
+
+// Item 2: an instance shutting down mid-processing cancels the context the processor runs in; the claim is still
+// released, with a context of its own, so the next poll anywhere retries it.
+func TestShouldReleaseClaimWhenShutDownMidProcessing(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+
+	m.SetProcessor(func(pctx context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		if calls.Add(1) == 1 {
+			cancel()
+
+			return pctx.Err()
+		}
+
+		return nil
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	m.Poll(ctx)
+
+	assert.Equal(t, int32(1), calls.Load())
+	assert.False(t, store.Get(id).ProcessedAt.Valid)
+	assert.False(t, store.Get(id).ClaimedAt.Valid, "the claim is released despite the shutdown")
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(2), calls.Load())
+	assert.True(t, store.Get(id).ProcessedAt.Valid)
+}
+
+// Item 2: an instance killed mid-processing never completes or releases its claim. The revocation is processed
+// once the claim is older than the lease, and not before.
+func TestShouldReclaimRevocationAfterLease(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	var calls atomic.Int32
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		calls.Add(1)
+
+		return nil
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	// The instance that dies.
+	ok, err := store.ClaimPlusUserSession(context.Background(), id, c.Now(), c.Now().Add(-ClaimLease))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	c.Set(c.Now().Add(ClaimLease - time.Second))
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(0), calls.Load(), "the claim still holds")
+
+	c.Set(c.Now().Add(2 * time.Second))
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(1), calls.Load())
+	assert.True(t, store.Get(id).ProcessedAt.Valid)
 }
 
 func TestShouldRejectGrantForRevokedRecord(t *testing.T) {
@@ -545,10 +643,14 @@ func TestShouldWriteActivityInRun(t *testing.T) {
 func TestShouldPurgeOldRecords(t *testing.T) {
 	m, store, c := newTestManager(t, true)
 
-	revoked, live, expired := testCreate(t, m), testCreate(t, m), testCreate(t, m)
+	revoked, unprocessed, live, expired := testCreate(t, m), testCreate(t, m), testCreate(t, m), testCreate(t, m)
 
-	_, err := m.Revoke(context.Background(), revoked, "john")
-	require.NoError(t, err)
+	for _, id := range []uuid.UUID{revoked, unprocessed} {
+		_, err := m.Revoke(context.Background(), id, "john")
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, store.CompletePlusUserSession(context.Background(), revoked, c.Now()))
 
 	store.Records[expired].ExpiresAt = c.Now().Add(-m.Retention() - time.Minute)
 	store.Records[live].ExpiresAt = c.Now().Add(m.Retention() + time.Hour)
@@ -560,4 +662,5 @@ func TestShouldPurgeOldRecords(t *testing.T) {
 	assert.Nil(t, store.Get(revoked))
 	assert.Nil(t, store.Get(expired))
 	assert.NotNil(t, store.Get(live))
+	assert.NotNil(t, store.Get(unprocessed), "item 3: a revocation is never purged before it's processed")
 }

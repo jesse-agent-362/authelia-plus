@@ -28,8 +28,9 @@ type Store interface {
 	ClosePlusUserSessions(ctx context.Context, revokedBy string, now time.Time) (count int64, err error)
 	EndPlusUserSession(ctx context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (ok bool, err error)
 	LoadPlusUserSessionRevokedIDs(ctx context.Context, since time.Time) (ids []uuid.UUID, err error)
-	LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before time.Time, limit int) (ids []uuid.UUID, err error)
-	ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) (ok bool, err error)
+	LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before, leaseBefore time.Time, limit int) (ids []uuid.UUID, err error)
+	ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now, leaseBefore time.Time) (ok bool, err error)
+	CompletePlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) (err error)
 	UnclaimPlusUserSession(ctx context.Context, id uuid.UUID) (err error)
 	PurgePlusUserSessions(ctx context.Context, revokedBefore, expiredBefore time.Time) (err error)
 }
@@ -56,6 +57,10 @@ const (
 	// processDelay is how long a revocation waits before it's processed. Every instance has stopped accepting the
 	// session by then, so no authorization in flight can still add a grant after the grants were revoked.
 	processDelay = 3 * pollInterval
+
+	// claimLease is how long a claim on a revocation holds. A claim older than this is taken over by the next poll,
+	// so a revocation whose instance died or shut down mid-processing is still processed.
+	claimLease = 5 * time.Minute
 
 	// processBatch bounds the revocations processed per poll.
 	processBatch = 100

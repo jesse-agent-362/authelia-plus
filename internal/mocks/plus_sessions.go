@@ -264,8 +264,6 @@ func (s *PlusSessionsStore) EndPlusUserSession(_ context.Context, id uuid.UUID, 
 		r.RevokedAt, r.RevokedBy = sql.NullTime{Time: now, Valid: true}, revokedBy
 	}
 
-	r.ProcessedAt = sql.NullTime{Time: now, Valid: true}
-
 	return true, nil
 }
 
@@ -286,7 +284,7 @@ func (s *PlusSessionsStore) LoadPlusUserSessionRevokedIDs(_ context.Context, sin
 	return ids, nil
 }
 
-func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context, before time.Time, limit int) (ids []uuid.UUID, err error) {
+func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context, before, leaseBefore time.Time, limit int) (ids []uuid.UUID, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -295,7 +293,7 @@ func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context,
 	}
 
 	for id, r := range s.Records {
-		if r.RevokedAt.Valid && !r.RevokedAt.Time.After(before) && !r.ProcessedAt.Valid && len(ids) < limit {
+		if r.RevokedAt.Valid && !r.RevokedAt.Time.After(before) && !r.ProcessedAt.Valid && (!r.ClaimedAt.Valid || r.ClaimedAt.Time.Before(leaseBefore)) && len(ids) < limit {
 			ids = append(ids, id)
 		}
 	}
@@ -303,7 +301,7 @@ func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context,
 	return ids, nil
 }
 
-func (s *PlusSessionsStore) ClaimPlusUserSession(_ context.Context, id uuid.UUID, now time.Time) (bool, error) {
+func (s *PlusSessionsStore) ClaimPlusUserSession(_ context.Context, id uuid.UUID, now, leaseBefore time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -312,16 +310,36 @@ func (s *PlusSessionsStore) ClaimPlusUserSession(_ context.Context, id uuid.UUID
 	}
 
 	r, ok := s.Records[id]
-	if !ok || r.ProcessedAt.Valid {
+	if !ok || !r.RevokedAt.Valid || r.ProcessedAt.Valid || (r.ClaimedAt.Valid && !r.ClaimedAt.Time.Before(leaseBefore)) {
 		return false, nil
 	}
 
-	r.ProcessedAt = sql.NullTime{Time: now, Valid: true}
+	r.ClaimedAt = sql.NullTime{Time: now, Valid: true}
 
 	return true, nil
 }
 
-func (s *PlusSessionsStore) UnclaimPlusUserSession(_ context.Context, id uuid.UUID) error {
+func (s *PlusSessionsStore) CompletePlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.Errors["CompletePlusUserSession"]; err != nil {
+		return err
+	}
+
+	// As a database would, so a write made with a cancelled context fails.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if r, ok := s.Records[id]; ok && !r.ProcessedAt.Valid {
+		r.ProcessedAt, r.ClaimedAt = sql.NullTime{Time: now, Valid: true}, sql.NullTime{}
+	}
+
+	return nil
+}
+
+func (s *PlusSessionsStore) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -329,8 +347,12 @@ func (s *PlusSessionsStore) UnclaimPlusUserSession(_ context.Context, id uuid.UU
 		return err
 	}
 
-	if r, ok := s.Records[id]; ok {
-		r.ProcessedAt = sql.NullTime{}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if r, ok := s.Records[id]; ok && !r.ProcessedAt.Valid {
+		r.ClaimedAt = sql.NullTime{}
 	}
 
 	return nil
@@ -345,7 +367,7 @@ func (s *PlusSessionsStore) PurgePlusUserSessions(_ context.Context, revokedBefo
 	}
 
 	for id, r := range s.Records {
-		if (r.RevokedAt.Valid && r.RevokedAt.Time.Before(revokedBefore)) || (!r.RevokedAt.Valid && r.ExpiresAt.Before(expiredBefore)) {
+		if (r.RevokedAt.Valid && r.RevokedAt.Time.Before(revokedBefore) && r.ProcessedAt.Valid) || (!r.RevokedAt.Valid && r.ExpiresAt.Before(expiredBefore)) {
 			delete(s.Records, id)
 		}
 	}

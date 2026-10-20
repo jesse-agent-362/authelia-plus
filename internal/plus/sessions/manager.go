@@ -129,7 +129,7 @@ func (m *Manager) Touch(userSession *session.UserSession, config schema.SessionC
 // Create records a new user session and returns its ID. The caller must not authenticate the session if this fails.
 //
 // A session already authenticated as the same user is a re-authentication: its record is replaced atomically, and its
-// grants move to the new record. That fails with ErrRecordUnavailable if the record was revoked or claimed meanwhile,
+// grants move to the new record. That fails with ErrRecordUnavailable if the record was revoked meanwhile,
 // so a revoke landing at the same moment can't be escaped. A session authenticated as another user is a switch: the
 // other user's record is revoked as on a logout, grants and all.
 func (m *Manager) Create(ctx context.Context, username, ip, userAgent string, keepMeLoggedIn bool, config schema.SessionCookie, previous uuid.UUID, previousUsername string) (id uuid.UUID, err error) {
@@ -191,7 +191,7 @@ func (m *Manager) Revoke(ctx context.Context, id uuid.UUID, username string) (ok
 }
 
 // RecordGrant adds an OAuth 2.0 authorization request to the record of the session it was made in, so revoking the
-// session can revoke its tokens. It returns ErrRecordUnavailable when the record is revoked, claimed or missing, in
+// session can revoke its tokens. It returns ErrRecordUnavailable when the record is revoked or missing, in
 // which case the caller must not issue the grant.
 func (m *Manager) RecordGrant(ctx context.Context, grant model.PlusUserSessionGrant) (err error) {
 	if m.Revoked(grant.SessionID) {
@@ -211,9 +211,10 @@ func (m *Manager) RecordGrant(ctx context.Context, grant model.PlusUserSessionGr
 	return nil
 }
 
-// End claims the record of a session being logged out, and returns its grants for the caller to revoke. It reports
-// false when the record is missing or was claimed already, by another logout or by an instance processing its revoke;
-// the grants are then not the caller's to act on. A claimed record's session is rejected by this instance immediately.
+// End revokes the record of a session being logged out, and returns its grants for the caller to revoke right away.
+// That's best effort: the revocation is processed in the background as for any other, so grants a failed or early
+// revoke missed are revoked anyway. It reports false when the record is missing or its revocation was processed
+// already. The session is rejected by this instance immediately.
 func (m *Manager) End(ctx context.Context, id uuid.UUID, username string) (grants []model.PlusUserSessionGrant, ok bool, err error) {
 	now := m.clock.Now().UTC()
 
@@ -223,10 +224,7 @@ func (m *Manager) End(ctx context.Context, id uuid.UUID, username string) (grant
 
 	m.markRevoked(id, now)
 
-	// Released on failure, so an instance processes the revocation, grants and all, in the background instead.
 	if grants, err = m.store.LoadPlusUserSessionGrants(ctx, id); err != nil {
-		m.unclaim(ctx, id)
-
 		return nil, false, err
 	}
 
