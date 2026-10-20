@@ -453,7 +453,7 @@ func TestOAuth2EndSession(t *testing.T) {
 		assertLoggedIn(t, mock, true)
 	})
 
-	t.Run("ShouldNotLogoutWithoutIDTokenHintButRedirectWithState", func(t *testing.T) {
+	t.Run("ShouldNotLogoutOrRedirectToClientWithoutIDTokenHint", func(t *testing.T) {
 		mock := setup(t)
 		defer mock.Close()
 
@@ -464,11 +464,11 @@ func TestOAuth2EndSession(t *testing.T) {
 		})
 
 		assert.Equal(t, http.StatusFound, code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI+"?state=abc123", location)
+		assert.Equal(t, testOIDCPortalURL, location)
 		assertLoggedIn(t, mock, true)
 	})
 
-	t.Run("ShouldNotLogoutWithIDTokenHintForAnotherUser", func(t *testing.T) {
+	t.Run("ShouldNotLogoutOrRedirectToClientWithIDTokenHintForAnotherUser", func(t *testing.T) {
 		mock := setup(t)
 		defer mock.Close()
 
@@ -485,7 +485,7 @@ func TestOAuth2EndSession(t *testing.T) {
 		})
 
 		assert.Equal(t, http.StatusFound, code)
-		assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
+		assert.Equal(t, testOIDCPortalURL, location)
 		assertLoggedIn(t, mock, true)
 	})
 
