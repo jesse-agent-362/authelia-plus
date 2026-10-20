@@ -414,6 +414,7 @@ func newStorageUserCmd(ctx *CmdCtx) (cmd *cobra.Command) {
 		newStorageUserIdentifiersCmd(ctx),
 		newStorageUserTOTPCmd(ctx),
 		newStorageUserWebAuthnCmd(ctx),
+		newStorageUserPlusSessionsCmd(ctx),
 	)
 
 	return cmd

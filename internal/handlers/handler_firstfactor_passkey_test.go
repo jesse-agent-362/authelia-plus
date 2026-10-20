@@ -7,6 +7,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -421,6 +422,11 @@ func TestFirstFactorPasskeyPOST(t *testing.T) {
 				require.NoError(t, err)
 
 				assert.Nil(t, us.WebAuthn)
+
+				// authelia-plus: the passkey login gets its own session record.
+				require.NotEqual(t, uuid.Nil, us.PlusID)
+				require.NotNil(t, mock.PlusSessionsStore.Get(us.PlusID))
+				assert.Equal(t, testUsername, mock.PlusSessionsStore.Get(us.PlusID).Username)
 			},
 		},
 		{
@@ -1948,6 +1954,36 @@ func TestFirstFactorPasskeyPOST(t *testing.T) {
 				AssertLogEntryMessageAndError(t, mock.LogEntryN(1), "Error occurred validating a WebAuthn passkey authentication challenge: error parsing the request body", "Parse error for Assertion (invalid_request): json: cannot unmarshal bool into Go value of type protocol.CredentialAssertionResponse")
 			},
 		},
+	}
+
+	// authelia-plus: the successful login fails closed when its session record can't be created.
+	for _, tc := range testCases {
+		if tc.name != "ShouldSuccess" {
+			continue
+		}
+
+		setup := tc.setup
+
+		tc.name = "ShouldFailWhenSessionRecordFails"
+		tc.setup = func(t *testing.T, mock *mocks.MockAutheliaCtx) {
+			setup(t, mock)
+
+			mock.PlusSessionsStore.SetError("SavePlusUserSession", errors.New("insert failed"))
+		}
+		tc.expected = `^\{"status":"KO","message":"Authentication failed, please retry later."}$`
+		tc.expectedStatus = fasthttp.StatusForbidden
+		tc.expectedf = func(t *testing.T, mock *mocks.MockAutheliaCtx) {
+			us, err := mock.Ctx.GetSession()
+
+			require.NoError(t, err)
+
+			assert.True(t, us.IsAnonymous())
+			assert.Empty(t, mock.PlusSessionsStore.Records)
+		}
+
+		testCases = append(testCases, tc)
+
+		break
 	}
 
 	for _, tc := range testCases {

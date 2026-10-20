@@ -10,6 +10,7 @@ import (
 
 	"github.com/fasthttp/session/v2"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/google/uuid"
 
 	"github.com/authelia/authelia/v4/internal/authorization"
 )
@@ -52,6 +53,9 @@ type UserSession struct {
 
 	// OpenIDConnect tracks this session's OpenID Connect 1.0 logout state. authelia-plus.
 	OpenIDConnect *OpenIDConnectLogout `json:",omitempty"`
+
+	// PlusID is the ID of this session's record, which the user can list and revoke. authelia-plus.
+	PlusID uuid.UUID `json:",omitzero"`
 }
 
 // TOTP holds the TOTP registration session data.

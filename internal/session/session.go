@@ -19,6 +19,8 @@ type Session struct {
 	Config schema.SessionCookie
 
 	sessionHolder *session.Session
+
+	plus PlusSessions
 }
 
 // NewDefaultUserSession returns a new default UserSession for this session provider.
@@ -52,6 +54,10 @@ func (p *Session) GetSession(ctx *fasthttp.RequestCtx) (userSession UserSession,
 
 	if err = json.Unmarshal(userSessionJSON, &userSession); err != nil {
 		return p.NewDefaultUserSession(), err
+	}
+
+	if p.plusRevoked(ctx, &userSession) {
+		return p.NewDefaultUserSession(), nil
 	}
 
 	return userSession, nil

@@ -139,6 +139,14 @@ func FirstFactorPasswordPOST(delayer middlewares.Delayer) middlewares.RequestHan
 
 		ctx.Logger.Tracef(logFmtTraceProfileDetails, details.Username, details.Groups, details.Emails)
 
+		if err = plusSessionsCreate(ctx, provider.Config, &userSession, details.Username, keepMeLoggedIn); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "session record", regulation.AuthType1FA, logFmtActionAuthentication, details.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
 		userSession.SetOneFactorPassword(ctx.GetClock().Now(), details, keepMeLoggedIn)
 
 		if ctx.Configuration.AuthenticationBackend.RefreshInterval.Update() {
@@ -269,6 +277,14 @@ func FirstFactorReauthenticatePOST(delayer middlewares.Delayer) middlewares.Requ
 		}
 
 		ctx.Logger.Tracef(logFmtTraceProfileDetails, userSession.Username, userDetails.Groups, userDetails.Emails)
+
+		if err = plusSessionsCreate(ctx, ctx.GetSessionConfig(), &userSession, userSession.Username, userSession.KeepMeLoggedIn); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "session record", regulation.AuthType1FA, logFmtActionAuthentication, userSession.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
 
 		userSession.SetOneFactorReauthenticate(ctx.GetClock().Now(), userDetails)
 

@@ -24,6 +24,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/clock"
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/middlewares"
+	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
 	"github.com/authelia/authelia/v4/internal/random"
 	"github.com/authelia/authelia/v4/internal/regulation"
 	"github.com/authelia/authelia/v4/internal/session"
@@ -45,6 +46,9 @@ type MockAutheliaCtx struct {
 	RandomMock       *MockRandom
 
 	Clock clock.Fixed
+
+	// PlusSessionsStore holds the user session records. authelia-plus.
+	PlusSessionsStore *PlusSessionsStore
 }
 
 // NewMockAutheliaCtx create an instance of AutheliaCtx mock.
@@ -214,6 +218,10 @@ func NewMockAutheliaCtx(t *testing.T) *MockAutheliaCtx {
 		&config)
 
 	providers.SessionProvider = session.NewProvider(config.Session, nil)
+
+	mockAuthelia.PlusSessionsStore = NewPlusSessionsStore()
+	providers.PlusSessions = plussessions.New(&config, mockAuthelia.PlusSessionsStore, &mockAuthelia.Clock)
+	providers.SessionProvider.SetPlusSessions(providers.PlusSessions)
 
 	providers.Regulator = regulation.NewRegulator(config.Regulation, providers.StorageProvider, &mockAuthelia.Clock)
 

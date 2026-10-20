@@ -334,6 +334,15 @@ func FirstFactorPasskeyPOST(ctx *middlewares.AutheliaCtx) {
 		"verified": response.Response.AuthenticatorData.Flags.HasUserVerified(),
 	}).Debug("Passkey Login")
 
+	if err = plusSessionsCreate(ctx, provider.Config, &userSession, details.Username, keepMeLoggedIn); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusForbidden)
+		ctx.SetJSONError(messageMFAValidationFailed)
+
+		ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "session record", regulation.AuthTypePasskey, logFmtActionAuthentication, details.Username)
+
+		return
+	}
+
 	userSession.SetOneFactorPasskey(
 		ctx.GetClock().Now(), details,
 		keepMeLoggedIn,

@@ -28,19 +28,44 @@ func NewDetachedContext(parent Context, timeout time.Duration) (ctx Context, can
 		return nil, nil, err
 	}
 
+	ctx, cancel = NewDetachedContextFromProviders(issuer, DetachedContextProviders{
+		Clock:    parent.GetClock(),
+		Random:   parent.GetRandom(),
+		Config:   parent.GetConfiguration(),
+		Storage:  parent.GetProviderStorage(),
+		Users:    parent.GetUserProvider(),
+		Resolver: parent.GetProviderUserAttributeResolver(),
+	}, timeout)
+
+	return ctx, cancel, nil
+}
+
+// DetachedContextProviders are the providers a detached Context carries.
+type DetachedContextProviders struct {
+	Clock    clock.Provider
+	Random   random.Provider
+	Config   *schema.Configuration
+	Storage  storage.Provider
+	Users    authentication.UserProvider
+	Resolver expression.UserAttributeResolver
+}
+
+// NewDetachedContextFromProviders returns a Context for issuer which is not tied to any request, for work done outside
+// of one. It is cancelled after timeout.
+func NewDetachedContextFromProviders(issuer *url.URL, providers DetachedContextProviders, timeout time.Duration) (ctx Context, cancel context.CancelFunc) {
 	detached := &detachedContext{
 		issuer:   issuer,
-		clock:    parent.GetClock(),
-		random:   parent.GetRandom(),
-		config:   parent.GetConfiguration(),
-		storage:  parent.GetProviderStorage(),
-		users:    parent.GetUserProvider(),
-		resolver: parent.GetProviderUserAttributeResolver(),
+		clock:    providers.Clock,
+		random:   providers.Random,
+		config:   providers.Config,
+		storage:  providers.Storage,
+		users:    providers.Users,
+		resolver: providers.Resolver,
 	}
 
 	detached.Context, cancel = context.WithTimeout(context.Background(), timeout)
 
-	return detached, cancel, nil
+	return detached, cancel
 }
 
 type detachedContext struct {

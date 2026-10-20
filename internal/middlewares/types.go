@@ -20,6 +20,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/notification"
 	"github.com/authelia/authelia/v4/internal/ntp"
 	"github.com/authelia/authelia/v4/internal/oidc"
+	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
 	"github.com/authelia/authelia/v4/internal/random"
 	"github.com/authelia/authelia/v4/internal/regulation"
 	"github.com/authelia/authelia/v4/internal/session"
@@ -58,6 +59,9 @@ type Providers struct {
 	MetaDataService       webauthn.MetaDataProvider
 
 	GarbageCollector *GarbageCollector
+
+	// PlusSessions is the record of user sessions. authelia-plus.
+	PlusSessions *plussessions.Manager
 
 	Random random.Provider
 	Clock  clock.Provider

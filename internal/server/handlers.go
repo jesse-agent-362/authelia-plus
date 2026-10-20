@@ -289,6 +289,15 @@ func handlerMain(config *schema.Configuration, providers middlewares.Providers) 
 		Build()
 
 	r.GET("/api/user/session/elevation", middleware1FA(handlers.UserSessionElevationGET))
+
+	// authelia-plus: the user's session list and revoke. No CORS policy and no GET form of the revoke.
+	middlewareFullAuth := middlewares.NewBridgeBuilder(*config, providers).
+		WithPreMiddlewares(middlewares.SecurityHeadersBase, middlewares.SecurityHeadersNoStore, middlewares.SecurityHeadersCSPNone).
+		WithPostMiddlewares(middlewares.RequireFullAuth).
+		Build()
+
+	r.GET("/api/plus/sessions", middlewareFullAuth(handlers.PlusSessionsGET))
+	r.DELETE("/api/plus/sessions/{sessionID}", middlewareFullAuth(handlers.PlusSessionDELETE))
 	r.POST("/api/user/session/elevation", middlewareElevatePOST(handlers.UserSessionElevationPOST))
 	r.PUT("/api/user/session/elevation", middlewareElevatePUT(handlers.UserSessionElevationPUT))
 

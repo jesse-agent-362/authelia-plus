@@ -5,6 +5,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -129,11 +130,21 @@ func oauth2EndSessionRedirectPortal(ctx *middlewares.AutheliaCtx, rw http.Respon
 //
 // The session is reloaded rather than taken from the caller: earlier steps of the request (consent) may have saved a
 // newer copy, which saving the caller's copy would undo.
-func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider *session.Session, client oidc.Client, requester oauthelia2.AuthorizeRequester, s *oidc.Session) {
-	userSession, err := provider.GetSession(ctx.RequestCtx)
-	if err != nil {
+//
+// The state is also mirrored onto the session's record so revoking the session can revoke the grants. An error means
+// that failed, and the authorization must not be granted.
+func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider *session.Session, client oidc.Client, requester oauthelia2.AuthorizeRequester, s *oidc.Session) (err error) {
+	var userSession session.UserSession
+
+	if userSession, err = provider.GetSession(ctx.RequestCtx); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred loading the user session to record the OpenID Connect 1.0 logout state for client with id '%s'", client.GetID())
-		return
+		return err
+	}
+
+	// The session was revoked or ended since the request began.
+	if userSession.IsAnonymous() {
+		ctx.GetLogger().Errorf("Error occurred recording the OpenID Connect 1.0 logout state for client with id '%s': the user session is no longer authenticated", client.GetID())
+		return errUserAnonymous
 	}
 
 	if userSession.OpenIDConnect == nil {
@@ -156,6 +167,13 @@ func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider
 	if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred saving the OpenID Connect 1.0 logout state for client with id '%s' to the user session", client.GetID())
 	}
+
+	if err = plusSessionsRecordOpenIDConnect(ctx, &userSession); err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Error occurred recording the OpenID Connect 1.0 logout state for client with id '%s' to the session record", client.GetID())
+		return err
+	}
+
+	return nil
 }
 
 // backChannelLogoutTimeout bounds how long Logout Token delivery may take in total. The library retries unreachable
@@ -179,7 +197,15 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 		ctx.GetLogger().WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of user '%s' during logout", userSession.Username)
 	}
 
-	if len(userSession.OpenIDConnect.Clients) == 0 {
+	oauth2BackChannelLogout(ctx, ctx.Providers.OpenIDConnect, ctx.GetLogger(), func() (oidc.Context, context.CancelFunc, error) {
+		return oidc.NewDetachedContext(ctx, backChannelLogoutTimeout)
+	}, userSession.Username, userSession.OpenIDConnect.SessionID, userSession.OpenIDConnect.Clients)
+}
+
+// oauth2BackChannelLogout sends a Logout Token with the 'sid' claim to each of the clients, off the calling goroutine.
+// The delivery runs in the Context returned by newContext, which must outlive the caller.
+func oauth2BackChannelLogout(ctx context.Context, provider *oidc.OpenIDConnectProvider, logger *logrus.Entry, newContext func() (oidc.Context, context.CancelFunc, error), username, sid string, sessionClients []session.OpenIDConnectLogoutClient) {
+	if len(sessionClients) == 0 {
 		return
 	}
 
@@ -189,10 +215,10 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 		clients  = map[string][]oauthelia2.Client{}
 	)
 
-	for _, c := range userSession.OpenIDConnect.Clients {
-		client, err := ctx.Providers.OpenIDConnect.GetClient(ctx, c.ClientID)
+	for _, c := range sessionClients {
+		client, err := provider.GetClient(ctx, c.ClientID)
 		if err != nil {
-			ctx.GetLogger().WithError(err).Warnf("Back-Channel Logout skipped client with id '%s' as it could not be loaded", c.ClientID)
+			logger.WithError(err).Warnf("Back-Channel Logout skipped client with id '%s' as it could not be loaded", c.ClientID)
 			continue
 		}
 
@@ -207,18 +233,11 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 		return
 	}
 
-	dctx, cancel, err := oidc.NewDetachedContext(ctx, backChannelLogoutTimeout)
+	dctx, cancel, err := newContext()
 	if err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Back-Channel Logout for user '%s' could not be performed as the issuer could not be determined", userSession.Username)
+		logger.WithError(err).Errorf("Back-Channel Logout for user '%s' could not be performed as the issuer could not be determined", username)
 		return
 	}
-
-	var (
-		provider = ctx.Providers.OpenIDConnect
-		logger   = ctx.GetLogger()
-		sid      = userSession.OpenIDConnect.SessionID
-		username = userSession.Username
-	)
 
 	goBackChannelLogout(func() {
 		defer cancel()

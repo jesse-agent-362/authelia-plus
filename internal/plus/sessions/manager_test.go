@@ -1,0 +1,451 @@
+// SPDX-FileCopyrightText: 2026 Authelia
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package sessions_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/authelia/authelia/v4/internal/clock"
+	"github.com/authelia/authelia/v4/internal/configuration/schema"
+	"github.com/authelia/authelia/v4/internal/mocks"
+	"github.com/authelia/authelia/v4/internal/model"
+	. "github.com/authelia/authelia/v4/internal/plus/sessions"
+	"github.com/authelia/authelia/v4/internal/session"
+)
+
+var errTest = errors.New("test error")
+
+func newTestConfig(redis bool) *schema.Configuration {
+	config := &schema.Configuration{}
+	config.Session.Cookies = []schema.SessionCookie{
+		{SessionCookieCommon: schema.SessionCookieCommon{Expiration: time.Hour, RememberMe: 24 * time.Hour}, Domain: "example.com"},
+	}
+
+	if redis {
+		config.Session.Redis = &schema.SessionRedis{}
+	}
+
+	return config
+}
+
+func newTestManager(t *testing.T, redis bool) (*Manager, *mocks.PlusSessionsStore, *clock.Fixed) {
+	t.Helper()
+
+	store := mocks.NewPlusSessionsStore()
+	c := clock.NewFixed(time.Unix(1760000000, 0))
+
+	return New(newTestConfig(redis), store, c), store, c
+}
+
+func testCookie() schema.SessionCookie {
+	return schema.SessionCookie{SessionCookieCommon: schema.SessionCookieCommon{Expiration: time.Hour, RememberMe: 24 * time.Hour}, Domain: "example.com"}
+}
+
+func testCreate(t *testing.T, m *Manager) uuid.UUID {
+	t.Helper()
+
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", false, testCookie(), "", uuid.Nil, nil)
+	require.NoError(t, err)
+
+	return id
+}
+
+func TestShouldCreateRecord(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", true, testCookie(), "", uuid.Nil, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, uuid.Version(7), id.Version())
+
+	record := store.Get(id)
+	require.NotNil(t, record)
+
+	assert.Equal(t, "john", record.Username)
+	assert.Equal(t, "192.0.2.1", record.IP)
+	assert.Equal(t, "Mozilla/5.0", record.UserAgent)
+	assert.Equal(t, c.Now().UTC(), record.CreatedAt)
+	assert.Equal(t, c.Now().UTC().Add(24*time.Hour), record.ExpiresAt)
+	assert.Equal(t, "[]", record.RequestIDs)
+	assert.False(t, record.RevokedAt.Valid)
+}
+
+// Requirement 3: the User-Agent and IP are capped, without splitting a UTF-8 sequence.
+func TestShouldCapUserAgentAndIP(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	ua := strings.Repeat("a", MaxUserAgent-1) + "é" + strings.Repeat("b", 100)
+	ip := strings.Repeat("1", 100)
+
+	id, err := m.Create(context.Background(), "john", ip, ua, false, testCookie(), "", uuid.Nil, nil)
+	require.NoError(t, err)
+
+	record := store.Get(id)
+	require.NotNil(t, record)
+
+	assert.Equal(t, strings.Repeat("a", MaxUserAgent-1), record.UserAgent)
+	assert.Len(t, record.IP, MaxIP)
+}
+
+// Requirement 3: a failed insert is an error, which the caller turns into a failed authentication.
+func TestShouldFailCreateWhenInsertFails(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	store.SetError("SavePlusUserSession", errTest)
+
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), "", uuid.Nil, nil)
+
+	assert.ErrorIs(t, err, errTest)
+	assert.Equal(t, uuid.Nil, id)
+	assert.Empty(t, store.Records)
+}
+
+func TestShouldReplacePreviousRecord(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	previous := testCreate(t, m)
+
+	logout := &session.OpenIDConnectLogout{RequestIDs: []string{"req1"}, SessionID: "sid", Clients: []session.OpenIDConnectLogoutClient{{ClientID: "app", Subject: "sub"}}}
+
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), "https://auth.example.com", previous, logout)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, previous, id)
+
+	old := store.Get(previous)
+	assert.True(t, old.RevokedAt.Valid)
+	assert.True(t, old.ProcessedAt.Valid, "the replaced record must not be processed: its grants moved to the new one")
+	assert.Equal(t, RevokedByReplace, old.RevokedBy)
+
+	record := store.Get(id)
+	assert.Equal(t, `["req1"]`, record.RequestIDs)
+	assert.JSONEq(t, `{"RequestIDs":null,"Issuer":"https://auth.example.com","SessionID":"sid","Clients":[{"ClientID":"app","Subject":"sub"}]}`, record.BackChannel)
+}
+
+// Requirement 4: the revoked set is loaded by the startup check, before anything is served, not by the first poll.
+func TestShouldLoadRevokedSetAtStartup(t *testing.T) {
+	store := mocks.NewPlusSessionsStore()
+	c := clock.NewFixed(time.Unix(1760000000, 0))
+
+	id := uuid.New()
+
+	require.NoError(t, store.SavePlusUserSession(context.Background(), model.PlusUserSession{ID: id, Username: "john", ExpiresAt: c.Now().Add(time.Hour)}))
+
+	_, err := store.RevokePlusUserSession(context.Background(), id, "john", RevokedBySelf, c.Now().Add(-time.Minute))
+	require.NoError(t, err)
+
+	m := New(newTestConfig(true), store, c)
+
+	assert.False(t, m.Revoked(id))
+
+	require.NoError(t, m.StartupCheck())
+
+	assert.True(t, m.Revoked(id))
+}
+
+// Requirement 4: if the set can't be loaded, the startup fails rather than serving without it.
+func TestShouldFailStartupWhenRevokedSetFails(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	store.SetError("LoadPlusUserSessionRevokedIDs", errTest)
+
+	assert.ErrorIs(t, m.StartupCheck(), errTest)
+}
+
+// Requirement 4: a failed refresh keeps the last good set.
+func TestShouldKeepRevokedSetWhenRefreshFails(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	_, err := store.RevokePlusUserSession(context.Background(), id, "john", RevokedByCLI, c.Now())
+	require.NoError(t, err)
+
+	require.NoError(t, m.StartupCheck())
+	require.True(t, m.Revoked(id))
+
+	store.SetError("LoadPlusUserSessionRevokedIDs", errTest)
+
+	c.Set(c.Now().Add(time.Minute))
+
+	m.Poll(context.Background())
+
+	assert.True(t, m.Revoked(id))
+}
+
+// The revoked ID is kept for the longest session lifetime after the revoke, however stale the record's expiry.
+func TestShouldKeepRevokedIDForRetention(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	assert.Equal(t, 24*time.Hour+time.Hour+5*time.Minute, m.Retention())
+
+	id := testCreate(t, m)
+
+	store.Records[id].ExpiresAt = c.Now().Add(-48 * time.Hour)
+
+	require.NoError(t, m.StartupCheck())
+
+	ok, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	c.Set(c.Now().Add(m.Retention() - time.Minute))
+	m.Poll(context.Background())
+
+	assert.True(t, m.Revoked(id))
+
+	c.Set(c.Now().Add(2 * time.Minute))
+	m.Poll(context.Background())
+
+	assert.False(t, m.Revoked(id))
+}
+
+func TestShouldPickUpRevokesFromOtherInstances(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	require.NoError(t, m.StartupCheck())
+
+	count, err := RevokeUser(context.Background(), store, "JOHN", c.Now())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
+
+	assert.False(t, m.Revoked(id))
+
+	m.Poll(context.Background())
+
+	assert.True(t, m.Revoked(id))
+}
+
+func TestShouldRevokeOnlyOwnRecord(t *testing.T) {
+	m, _, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	ok, err := m.Revoke(context.Background(), id, "harry")
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.False(t, m.Revoked(id))
+
+	ok, err = m.Revoke(context.Background(), uuid.New(), "john")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	ok, err = m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.True(t, m.Revoked(id))
+
+	ok, err = m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestShouldCloseRecordsOnRestartWithMemoryProvider(t *testing.T) {
+	m, store, c := newTestManager(t, false)
+
+	id := testCreate(t, m)
+
+	require.NoError(t, m.StartupCheck())
+
+	record := store.Get(id)
+	assert.True(t, record.RevokedAt.Valid)
+	assert.Equal(t, RevokedByRestart, record.RevokedBy)
+	assert.True(t, record.ProcessedAt.Valid)
+
+	var calls atomic.Int32
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ *OpenIDConnectState) error {
+		calls.Add(1)
+		return nil
+	})
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(0), calls.Load(), "a restart must not revoke the OpenID Connect 1.0 grants")
+}
+
+func TestShouldNotCloseRecordsOnRestartWithRedisProvider(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	require.NoError(t, m.StartupCheck())
+
+	assert.False(t, store.Get(id).RevokedAt.Valid)
+}
+
+func TestShouldProcessRevocationOnceAfterDelay(t *testing.T) {
+	store := mocks.NewPlusSessionsStore()
+	c := clock.NewFixed(time.Unix(1760000000, 0))
+
+	a, b := New(newTestConfig(true), store, c), New(newTestConfig(true), store, c)
+
+	var (
+		calls atomic.Int32
+		got   *OpenIDConnectState
+	)
+
+	processor := func(_ context.Context, record *model.PlusUserSession, state *OpenIDConnectState) error {
+		calls.Add(1)
+
+		got = state
+
+		return nil
+	}
+
+	a.SetProcessor(processor)
+	b.SetProcessor(processor)
+
+	id := testCreate(t, a)
+
+	require.NoError(t, a.RecordOpenIDConnect(context.Background(), id, "https://auth.example.com", &session.OpenIDConnectLogout{RequestIDs: []string{"req1", "req2"}, SessionID: "sid", Clients: []session.OpenIDConnectLogoutClient{{ClientID: "app", Subject: "sub"}}}))
+
+	ok, err := a.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	a.Poll(context.Background())
+	b.Poll(context.Background())
+
+	assert.Equal(t, int32(0), calls.Load(), "the revocation must wait until every instance rejects the session")
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	a.Poll(context.Background())
+	b.Poll(context.Background())
+	a.Poll(context.Background())
+
+	assert.Equal(t, int32(1), calls.Load())
+	require.NotNil(t, got)
+	assert.Equal(t, []string{"req1", "req2"}, got.RequestIDs)
+	assert.Equal(t, "https://auth.example.com", got.Issuer)
+	assert.Equal(t, "sid", got.SessionID)
+	assert.Equal(t, []OpenIDConnectClient{{ClientID: "app", Subject: "sub"}}, got.Clients)
+
+	// Once claimed, no further grant can be recorded onto the record.
+	assert.ErrorIs(t, b.RecordOpenIDConnect(context.Background(), id, "", &session.OpenIDConnectLogout{RequestIDs: []string{"req3"}}), ErrRecordUnavailable)
+}
+
+func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
+	m, _, c := newTestManager(t, true)
+
+	var calls atomic.Int32
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ *OpenIDConnectState) error {
+		if calls.Add(1) == 1 {
+			return errTest
+		}
+
+		return nil
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	m.Poll(context.Background())
+	m.Poll(context.Background())
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestShouldRejectOpenIDConnectStateForRevokedRecord(t *testing.T) {
+	m, _, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	assert.ErrorIs(t, m.RecordOpenIDConnect(context.Background(), id, "", &session.OpenIDConnectLogout{}), ErrRecordUnavailable)
+	assert.ErrorIs(t, m.RecordOpenIDConnect(context.Background(), uuid.New(), "", &session.OpenIDConnectLogout{}), ErrRecordUnavailable)
+}
+
+func TestShouldThrottleAndBoundActivityWrites(t *testing.T) {
+	m, _, c := newTestManager(t, true)
+
+	userSession := &session.UserSession{Username: "john", PlusID: uuid.New()}
+
+	m.Touch(userSession, testCookie())
+	m.Touch(userSession, testCookie())
+
+	assert.Equal(t, 1, m.QueuedWrites())
+
+	c.Set(c.Now().Add(TouchInterval))
+
+	m.Touch(userSession, testCookie())
+
+	assert.Equal(t, 2, m.QueuedWrites())
+
+	for range WriteQueue * 2 {
+		m.Touch(&session.UserSession{Username: "john", PlusID: uuid.New()}, testCookie())
+	}
+
+	assert.Equal(t, WriteQueue, m.QueuedWrites())
+}
+
+func TestShouldWriteActivityInRun(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	c.Set(c.Now().Add(TouchInterval))
+
+	m.Touch(&session.UserSession{Username: "john", PlusID: id, KeepMeLoggedIn: true}, testCookie())
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+
+	go func() {
+		m.Run(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return store.Get(id).LastActive.Equal(c.Now().UTC())
+	}, 5*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, c.Now().UTC().Add(24*time.Hour), store.Get(id).ExpiresAt)
+
+	cancel()
+	<-done
+}
+
+func TestShouldPurgeOldRecords(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	revoked, live, expired := testCreate(t, m), testCreate(t, m), testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), revoked, "john")
+	require.NoError(t, err)
+
+	store.Records[expired].ExpiresAt = c.Now().Add(-m.Retention() - time.Minute)
+	store.Records[live].ExpiresAt = c.Now().Add(m.Retention() + time.Hour)
+
+	c.Set(c.Now().Add(m.Retention() + time.Minute))
+
+	m.Purge(context.Background())
+
+	assert.Nil(t, store.Get(revoked))
+	assert.Nil(t, store.Get(expired))
+	assert.NotNil(t, store.Get(live))
+}
