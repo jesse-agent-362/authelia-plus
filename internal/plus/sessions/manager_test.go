@@ -55,7 +55,7 @@ func testCookie() schema.SessionCookie {
 func testCreate(t *testing.T, m *Manager) uuid.UUID {
 	t.Helper()
 
-	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", false, testCookie(), "", uuid.Nil, nil)
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", false, testCookie(), uuid.Nil, "")
 	require.NoError(t, err)
 
 	return id
@@ -64,7 +64,7 @@ func testCreate(t *testing.T, m *Manager) uuid.UUID {
 func TestShouldCreateRecord(t *testing.T) {
 	m, store, c := newTestManager(t, true)
 
-	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", true, testCookie(), "", uuid.Nil, nil)
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "Mozilla/5.0", true, testCookie(), uuid.Nil, "")
 	require.NoError(t, err)
 
 	assert.Equal(t, uuid.Version(7), id.Version())
@@ -77,7 +77,6 @@ func TestShouldCreateRecord(t *testing.T) {
 	assert.Equal(t, "Mozilla/5.0", record.UserAgent)
 	assert.Equal(t, c.Now().UTC(), record.CreatedAt)
 	assert.Equal(t, c.Now().UTC().Add(24*time.Hour), record.ExpiresAt)
-	assert.Equal(t, "[]", record.RequestIDs)
 	assert.False(t, record.RevokedAt.Valid)
 }
 
@@ -88,7 +87,7 @@ func TestShouldCapUserAgentAndIP(t *testing.T) {
 	ua := strings.Repeat("a", MaxUserAgent-1) + "é" + strings.Repeat("b", 100)
 	ip := strings.Repeat("1", 100)
 
-	id, err := m.Create(context.Background(), "john", ip, ua, false, testCookie(), "", uuid.Nil, nil)
+	id, err := m.Create(context.Background(), "john", ip, ua, false, testCookie(), uuid.Nil, "")
 	require.NoError(t, err)
 
 	record := store.Get(id)
@@ -104,7 +103,7 @@ func TestShouldFailCreateWhenInsertFails(t *testing.T) {
 
 	store.SetError("SavePlusUserSession", errTest)
 
-	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), "", uuid.Nil, nil)
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), uuid.Nil, "")
 
 	assert.ErrorIs(t, err, errTest)
 	assert.Equal(t, uuid.Nil, id)
@@ -116,9 +115,9 @@ func TestShouldReplacePreviousRecord(t *testing.T) {
 
 	previous := testCreate(t, m)
 
-	logout := &session.OpenIDConnectLogout{RequestIDs: []string{"req1"}, SessionID: "sid", Clients: []session.OpenIDConnectLogoutClient{{ClientID: "app", Subject: "sub"}}}
+	require.NoError(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: previous, RequestID: "req1"}))
 
-	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), "https://auth.example.com", previous, logout)
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), previous, "john")
 	require.NoError(t, err)
 
 	assert.NotEqual(t, previous, id)
@@ -127,10 +126,85 @@ func TestShouldReplacePreviousRecord(t *testing.T) {
 	assert.True(t, old.RevokedAt.Valid)
 	assert.True(t, old.ProcessedAt.Valid, "the replaced record must not be processed: its grants moved to the new one")
 	assert.Equal(t, RevokedByReplace, old.RevokedBy)
+	assert.True(t, m.Revoked(previous))
+
+	require.Len(t, store.Grants, 1)
+	assert.Equal(t, id, store.Grants[0].SessionID)
+}
+
+// A re-authentication racing a revoke of the record it replaces must fail, or the revoked session would carry on under
+// a fresh record.
+func TestShouldFailReplaceWhenPreviousRevoked(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	previous := testCreate(t, m)
+
+	// Revoked by the CLI, which this instance hasn't polled yet.
+	_, err := RevokeUser(context.Background(), store, "john", time.Unix(1760000000, 0))
+	require.NoError(t, err)
+	require.False(t, m.Revoked(previous))
+
+	id, err := m.Create(context.Background(), "john", "192.0.2.1", "ua", false, testCookie(), previous, "john")
+
+	assert.ErrorIs(t, err, ErrRecordUnavailable)
+	assert.Equal(t, uuid.Nil, id)
+	assert.Len(t, store.Records, 1, "no replacement is recorded")
+	assert.False(t, store.Get(previous).ProcessedAt.Valid, "the revoke is still processed")
+}
+
+// Logging in as another user over an authenticated session ends the other user's session, grants and all.
+func TestShouldRevokePreviousRecordOnUserSwitch(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	previous := testCreate(t, m)
+
+	id, err := m.Create(context.Background(), "harry", "192.0.2.1", "ua", false, testCookie(), previous, "john")
+	require.NoError(t, err)
+
+	old := store.Get(previous)
+	assert.True(t, old.RevokedAt.Valid)
+	assert.False(t, old.ProcessedAt.Valid, "the other user's grants are revoked in the background")
+	assert.Equal(t, RevokedBySwitch, old.RevokedBy)
+	assert.Equal(t, "harry", store.Get(id).Username)
+}
+
+func TestShouldEndRecordOnLogout(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	require.NoError(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}))
+
+	grants, ok, err := m.End(context.Background(), id, "john")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, []model.PlusUserSessionGrant{{SessionID: id, RequestID: "req1"}}, grants)
 
 	record := store.Get(id)
-	assert.Equal(t, `["req1"]`, record.RequestIDs)
-	assert.JSONEq(t, `{"RequestIDs":null,"Issuer":"https://auth.example.com","SessionID":"sid","Clients":[{"ClientID":"app","Subject":"sub"}]}`, record.BackChannel)
+	assert.Equal(t, RevokedByLogout, record.RevokedBy)
+	assert.True(t, record.ProcessedAt.Valid, "the logout acts on the grants itself")
+	assert.True(t, m.Revoked(id))
+
+	_, ok, err = m.End(context.Background(), id, "john")
+	require.NoError(t, err)
+	assert.False(t, ok, "a second logout leaves the grants alone")
+}
+
+// A logout which can't load the grants releases the record, so the revocation is processed in the background.
+func TestShouldReleaseRecordWhenEndCannotLoadGrants(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	store.SetError("LoadPlusUserSessionGrants", errTest)
+
+	_, ok, err := m.End(context.Background(), id, "john")
+	assert.ErrorIs(t, err, errTest)
+	assert.False(t, ok)
+
+	record := store.Get(id)
+	assert.True(t, record.RevokedAt.Valid)
+	assert.False(t, record.ProcessedAt.Valid)
 }
 
 // Requirement 4: the revoked set is loaded by the startup check, before anything is served, not by the first poll.
@@ -220,6 +294,10 @@ func TestShouldPickUpRevokesFromOtherInstances(t *testing.T) {
 
 	count, err := RevokeUser(context.Background(), store, "JOHN", c.Now())
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), count, "the username is matched exactly, as on every other path")
+
+	count, err = RevokeUser(context.Background(), store, "john", c.Now())
+	require.NoError(t, err)
 	assert.Equal(t, int64(1), count)
 
 	assert.False(t, m.Revoked(id))
@@ -267,7 +345,7 @@ func TestShouldCloseRecordsOnRestartWithMemoryProvider(t *testing.T) {
 
 	var calls atomic.Int32
 
-	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ *OpenIDConnectState) error {
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
 		calls.Add(1)
 		return nil
 	})
@@ -296,13 +374,13 @@ func TestShouldProcessRevocationOnceAfterDelay(t *testing.T) {
 
 	var (
 		calls atomic.Int32
-		got   *OpenIDConnectState
+		got   []model.PlusUserSessionGrant
 	)
 
-	processor := func(_ context.Context, record *model.PlusUserSession, state *OpenIDConnectState) error {
+	processor := func(_ context.Context, record *model.PlusUserSession, grants []model.PlusUserSessionGrant) error {
 		calls.Add(1)
 
-		got = state
+		got = grants
 
 		return nil
 	}
@@ -312,7 +390,8 @@ func TestShouldProcessRevocationOnceAfterDelay(t *testing.T) {
 
 	id := testCreate(t, a)
 
-	require.NoError(t, a.RecordOpenIDConnect(context.Background(), id, "https://auth.example.com", &session.OpenIDConnectLogout{RequestIDs: []string{"req1", "req2"}, SessionID: "sid", Clients: []session.OpenIDConnectLogoutClient{{ClientID: "app", Subject: "sub"}}}))
+	require.NoError(t, a.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}))
+	require.NoError(t, b.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req2", ClientID: "app", Subject: "sub", SID: "sid", Issuer: "https://auth.example.com"}))
 
 	ok, err := a.Revoke(context.Background(), id, "john")
 	require.NoError(t, err)
@@ -330,14 +409,47 @@ func TestShouldProcessRevocationOnceAfterDelay(t *testing.T) {
 	a.Poll(context.Background())
 
 	assert.Equal(t, int32(1), calls.Load())
-	require.NotNil(t, got)
-	assert.Equal(t, []string{"req1", "req2"}, got.RequestIDs)
-	assert.Equal(t, "https://auth.example.com", got.Issuer)
-	assert.Equal(t, "sid", got.SessionID)
-	assert.Equal(t, []OpenIDConnectClient{{ClientID: "app", Subject: "sub"}}, got.Clients)
+	assert.Equal(t, []model.PlusUserSessionGrant{
+		{SessionID: id, RequestID: "req1"},
+		{SessionID: id, RequestID: "req2", ClientID: "app", Subject: "sub", SID: "sid", Issuer: "https://auth.example.com"},
+	}, got)
 
-	// Once claimed, no further grant can be recorded onto the record.
-	assert.ErrorIs(t, b.RecordOpenIDConnect(context.Background(), id, "", &session.OpenIDConnectLogout{RequestIDs: []string{"req3"}}), ErrRecordUnavailable)
+	// Once revoked, no further grant can be recorded onto the record on any instance.
+	assert.ErrorIs(t, b.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req3"}), ErrRecordUnavailable)
+}
+
+// A record whose grants can't be loaded is released for a retry rather than left claimed with its grants unrevoked.
+func TestShouldRetryRevocationWhenGrantsFailToLoad(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	var calls atomic.Int32
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		calls.Add(1)
+
+		return nil
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	store.SetError("LoadPlusUserSessionGrants", errTest)
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(0), calls.Load())
+	assert.False(t, store.Get(id).ProcessedAt.Valid, "the claim is released")
+
+	store.SetError("LoadPlusUserSessionGrants", nil)
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, int32(1), calls.Load())
+	assert.True(t, store.Get(id).ProcessedAt.Valid)
 }
 
 func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
@@ -345,7 +457,7 @@ func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
 
 	var calls atomic.Int32
 
-	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ *OpenIDConnectState) error {
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
 		if calls.Add(1) == 1 {
 			return errTest
 		}
@@ -367,7 +479,7 @@ func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load())
 }
 
-func TestShouldRejectOpenIDConnectStateForRevokedRecord(t *testing.T) {
+func TestShouldRejectGrantForRevokedRecord(t *testing.T) {
 	m, _, _ := newTestManager(t, true)
 
 	id := testCreate(t, m)
@@ -375,8 +487,8 @@ func TestShouldRejectOpenIDConnectStateForRevokedRecord(t *testing.T) {
 	_, err := m.Revoke(context.Background(), id, "john")
 	require.NoError(t, err)
 
-	assert.ErrorIs(t, m.RecordOpenIDConnect(context.Background(), id, "", &session.OpenIDConnectLogout{}), ErrRecordUnavailable)
-	assert.ErrorIs(t, m.RecordOpenIDConnect(context.Background(), uuid.New(), "", &session.OpenIDConnectLogout{}), ErrRecordUnavailable)
+	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}), ErrRecordUnavailable)
+	assert.ErrorIs(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: uuid.New(), RequestID: "req1"}), ErrRecordUnavailable)
 }
 
 func TestShouldThrottleAndBoundActivityWrites(t *testing.T) {

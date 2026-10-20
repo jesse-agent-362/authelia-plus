@@ -7,6 +7,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	oauthelia2 "authelia.com/provider/oauth2"
 
 	"github.com/authelia/authelia/v4/internal/middlewares"
+	"github.com/authelia/authelia/v4/internal/model"
 	"github.com/authelia/authelia/v4/internal/oidc"
 	"github.com/authelia/authelia/v4/internal/random"
 	"github.com/authelia/authelia/v4/internal/session"
@@ -153,7 +155,16 @@ func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider
 
 	userSession.OpenIDConnect.RequestIDs = append(userSession.OpenIDConnect.RequestIDs, requester.GetID())
 
+	grant := model.PlusUserSessionGrant{RequestID: requester.GetID()}
+
 	if c, ok := client.(oauthelia2.BackChannelLogoutClient); ok && c.GetBackChannelLogoutURI() != "" {
+		var issuer *url.URL
+
+		if issuer, err = ctx.IssuerURL(); err != nil {
+			ctx.GetLogger().WithError(err).Errorf("Error occurred determining the issuer to record the OpenID Connect 1.0 logout state for client with id '%s'", client.GetID())
+			return err
+		}
+
 		if userSession.OpenIDConnect.SessionID == "" {
 			userSession.OpenIDConnect.SessionID = ctx.Providers.Random.StringCustom(32, random.CharSetAlphaNumeric)
 		}
@@ -161,16 +172,20 @@ func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider
 		s.Claims.SessionID = userSession.OpenIDConnect.SessionID
 
 		userSession.AddOpenIDConnectLogoutClient(client.GetID(), s.Subject)
+
+		grant.ClientID, grant.Subject, grant.SID, grant.Issuer = client.GetID(), s.Subject, userSession.OpenIDConnect.SessionID, issuer.String()
 	}
 
-	// Not fatal: the user still gets their tokens, they just won't be revoked or announced when this session ends.
+	// Recorded as its own row, so concurrent authorizations in the session can't lose each other's grants.
+	if err = plusSessionsRecordGrant(ctx, &userSession, grant); err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Error occurred recording the authorization for client with id '%s' to the session record", client.GetID())
+		return err
+	}
+
+	// Not fatal: the session record holds the grant, this copy only names the Back-Channel Logout clients for later
+	// ID Tokens.
 	if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred saving the OpenID Connect 1.0 logout state for client with id '%s' to the user session", client.GetID())
-	}
-
-	if err = plusSessionsRecordOpenIDConnect(ctx, &userSession); err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Error occurred recording the OpenID Connect 1.0 logout state for client with id '%s' to the session record", client.GetID())
-		return err
 	}
 
 	return nil
@@ -188,18 +203,62 @@ var goBackChannelLogout = func(deliver func()) { go deliver() }
 // with a 'backchannel_logout_uri' is sent a Logout Token. Grants from the user's other sessions, including
 // 'offline_access' ones, are left alone. It must run before the user session is destroyed. Failures are logged and
 // never block the logout.
+//
+// The grants come from the session's record, which the logout also closes. Should that fail, the session's own copy
+// is used instead: a record that was closed is released for the revocation to be processed in the background, and one
+// that wasn't stays open until it expires, its session destroyed by the logout regardless.
 func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession) {
-	if ctx.Providers.OpenIDConnect == nil || userSession.Username == "" || userSession.OpenIDConnect == nil {
+	if userSession.Username == "" {
 		return
 	}
 
-	if err := ctx.Providers.StorageProvider.RevokeOAuth2SessionsByRequestIDs(ctx, userSession.OpenIDConnect.RequestIDs); err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of user '%s' during logout", userSession.Username)
+	var grants []model.PlusUserSessionGrant
+
+	if ctx.Providers.PlusSessions != nil && userSession.PlusID != uuid.Nil {
+		var (
+			ok  bool
+			err error
+		)
+
+		switch grants, ok, err = ctx.Providers.PlusSessions.End(ctx, userSession.PlusID, userSession.Username); {
+		case err != nil:
+			ctx.GetLogger().WithError(err).Errorf("Error occurred closing the session record of user '%s' during logout", userSession.Username)
+
+			grants = oauth2LogoutSessionGrants(userSession)
+		case !ok:
+			// Already claimed: the revocation of this session is being processed elsewhere.
+			return
+		}
+	} else {
+		grants = oauth2LogoutSessionGrants(userSession)
 	}
 
-	oauth2BackChannelLogout(ctx, ctx.Providers.OpenIDConnect, ctx.GetLogger(), func() (oidc.Context, context.CancelFunc, error) {
+	if ctx.Providers.OpenIDConnect == nil || len(grants) == 0 {
+		return
+	}
+
+	if err := plusSessionsRevokeGrants(ctx, ctx.Providers.OpenIDConnect, ctx.Providers.StorageProvider, ctx.GetLogger(), func(_ string) (oidc.Context, context.CancelFunc, error) {
 		return oidc.NewDetachedContext(ctx, backChannelLogoutTimeout)
-	}, userSession.Username, userSession.OpenIDConnect.SessionID, userSession.OpenIDConnect.Clients)
+	}, userSession.Username, grants); err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of user '%s' during logout", userSession.Username)
+	}
+}
+
+// oauth2LogoutSessionGrants returns the grants recorded in the user session's own copy of its logout state.
+func oauth2LogoutSessionGrants(userSession *session.UserSession) (grants []model.PlusUserSessionGrant) {
+	if userSession.OpenIDConnect == nil {
+		return nil
+	}
+
+	for _, id := range userSession.OpenIDConnect.RequestIDs {
+		grants = append(grants, model.PlusUserSessionGrant{RequestID: id})
+	}
+
+	for _, c := range userSession.OpenIDConnect.Clients {
+		grants = append(grants, model.PlusUserSessionGrant{ClientID: c.ClientID, Subject: c.Subject, SID: userSession.OpenIDConnect.SessionID})
+	}
+
+	return grants
 }
 
 // oauth2BackChannelLogout sends a Logout Token with the 'sid' claim to each of the clients, off the calling goroutine.

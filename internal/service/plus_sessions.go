@@ -52,11 +52,14 @@ func (service *PlusSessions) ServiceName() string {
 	return "main"
 }
 
-// Run the session record poller until the service is shut down.
+// Run the session record poller until the service is shut down. A panic is returned as an error rather than swallowed:
+// without the poller this instance would stop learning about revocations, so the process must stop instead.
 func (service *PlusSessions) Run() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			service.log.WithError(recoverErr(r)).Error("Critical error caught (recovered)")
+			err = recoverErr(r)
+
+			service.log.WithError(err).Error("Critical error caught (recovered), stopping as revoked user sessions can no longer be tracked")
 		}
 	}()
 

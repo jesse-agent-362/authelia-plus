@@ -17,14 +17,16 @@ import (
 type Store interface {
 	PlusUserSessionsSchemaEnsure(ctx context.Context) (err error)
 	SavePlusUserSession(ctx context.Context, s model.PlusUserSession) (err error)
+	ReplacePlusUserSession(ctx context.Context, previous uuid.UUID, s model.PlusUserSession, revokedBy string) (ok bool, err error)
 	LoadPlusUserSession(ctx context.Context, id uuid.UUID) (s *model.PlusUserSession, err error)
 	LoadPlusUserSessionsActive(ctx context.Context, username string, now time.Time) (sessions []model.PlusUserSession, err error)
 	UpdatePlusUserSessionActivity(ctx context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (err error)
-	UpdatePlusUserSessionOpenIDConnect(ctx context.Context, id uuid.UUID, requestIDs, backChannel string) (ok bool, err error)
+	SavePlusUserSessionGrant(ctx context.Context, grant model.PlusUserSessionGrant) (ok bool, err error)
+	LoadPlusUserSessionGrants(ctx context.Context, id uuid.UUID) (grants []model.PlusUserSessionGrant, err error)
 	RevokePlusUserSession(ctx context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (ok bool, err error)
 	RevokePlusUserSessionsByUsername(ctx context.Context, username, revokedBy string, now time.Time) (count int64, err error)
 	ClosePlusUserSessions(ctx context.Context, revokedBy string, now time.Time) (count int64, err error)
-	ClosePlusUserSession(ctx context.Context, id uuid.UUID, revokedBy string, now time.Time) (err error)
+	EndPlusUserSession(ctx context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (ok bool, err error)
 	LoadPlusUserSessionRevokedIDs(ctx context.Context, since time.Time) (ids []uuid.UUID, err error)
 	LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before time.Time, limit int) (ids []uuid.UUID, err error)
 	ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now time.Time) (ok bool, err error)
@@ -35,28 +37,7 @@ type Store interface {
 // Processor performs the side effects of a revoked user session record: revoking its OpenID Connect 1.0 grants and
 // sending its Back-Channel Logout tokens. An error means the grants may not have been revoked, and the record is
 // retried.
-type Processor func(ctx context.Context, record *model.PlusUserSession, state *OpenIDConnectState) (err error)
-
-// OpenIDConnectState is the OpenID Connect 1.0 state of a user session record.
-type OpenIDConnectState struct {
-	// RequestIDs are the authorization requests made in the session.
-	RequestIDs []string
-
-	// Issuer is the issuer the Back-Channel Logout clients were issued ID Tokens by.
-	Issuer string `json:",omitempty"`
-
-	// SessionID is the 'sid' claim issued to the Back-Channel Logout clients.
-	SessionID string `json:",omitempty"`
-
-	// Clients are the Back-Channel Logout clients.
-	Clients []OpenIDConnectClient `json:",omitempty"`
-}
-
-// OpenIDConnectClient is a Back-Channel Logout client and the subject its ID Tokens were issued for.
-type OpenIDConnectClient struct {
-	ClientID string
-	Subject  string
-}
+type Processor func(ctx context.Context, record *model.PlusUserSession, grants []model.PlusUserSessionGrant) (err error)
 
 // Who revoked a user session record.
 const (
@@ -64,6 +45,8 @@ const (
 	RevokedByCLI     = "cli"
 	RevokedByRestart = "restart"
 	RevokedByReplace = "replaced"
+	RevokedByLogout  = "logout"
+	RevokedBySwitch  = "switched"
 )
 
 const (

@@ -8,7 +8,6 @@ import (
 	"context"
 	"database/sql"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +29,7 @@ type PlusSessionsStore struct {
 	mu sync.Mutex
 
 	Records map[uuid.UUID]*model.PlusUserSession
+	Grants  []model.PlusUserSessionGrant
 	Errors  map[string]error
 }
 
@@ -130,22 +130,67 @@ func (s *PlusSessionsStore) UpdatePlusUserSessionActivity(_ context.Context, id 
 	return nil
 }
 
-func (s *PlusSessionsStore) UpdatePlusUserSessionOpenIDConnect(_ context.Context, id uuid.UUID, requestIDs, backChannel string) (bool, error) {
+func (s *PlusSessionsStore) ReplacePlusUserSession(_ context.Context, previous uuid.UUID, r model.PlusUserSession, revokedBy string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.Errors["UpdatePlusUserSessionOpenIDConnect"]; err != nil {
+	if err := s.Errors["ReplacePlusUserSession"]; err != nil {
 		return false, err
 	}
 
-	r, ok := s.Records[id]
-	if !ok || r.ProcessedAt.Valid {
+	p, ok := s.Records[previous]
+	if !ok || p.Username != r.Username || p.RevokedAt.Valid || p.ProcessedAt.Valid {
 		return false, nil
 	}
 
-	r.RequestIDs, r.BackChannel = requestIDs, backChannel
+	p.RevokedAt, p.RevokedBy, p.ProcessedAt = sql.NullTime{Time: r.CreatedAt, Valid: true}, revokedBy, sql.NullTime{Time: r.CreatedAt, Valid: true}
+
+	s.Records[r.ID] = &r
+
+	for i := range s.Grants {
+		if s.Grants[i].SessionID == previous {
+			s.Grants[i].SessionID = r.ID
+		}
+	}
 
 	return true, nil
+}
+
+func (s *PlusSessionsStore) SavePlusUserSessionGrant(_ context.Context, grant model.PlusUserSessionGrant) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.Errors["SavePlusUserSessionGrant"]; err != nil {
+		return false, err
+	}
+
+	r, ok := s.Records[grant.SessionID]
+	if !ok || r.RevokedAt.Valid || r.ProcessedAt.Valid {
+		return false, nil
+	}
+
+	r.Grants++
+
+	s.Grants = append(s.Grants, grant)
+
+	return true, nil
+}
+
+func (s *PlusSessionsStore) LoadPlusUserSessionGrants(_ context.Context, id uuid.UUID) (grants []model.PlusUserSessionGrant, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err = s.Errors["LoadPlusUserSessionGrants"]; err != nil {
+		return nil, err
+	}
+
+	for _, g := range s.Grants {
+		if g.SessionID == id {
+			grants = append(grants, g)
+		}
+	}
+
+	return grants, nil
 }
 
 func (s *PlusSessionsStore) RevokePlusUserSession(_ context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (bool, error) {
@@ -175,7 +220,7 @@ func (s *PlusSessionsStore) RevokePlusUserSessionsByUsername(_ context.Context, 
 	}
 
 	for _, r := range s.Records {
-		if strings.EqualFold(r.Username, username) && !r.RevokedAt.Valid {
+		if r.Username == username && !r.RevokedAt.Valid {
 			r.RevokedAt, r.RevokedBy = sql.NullTime{Time: now, Valid: true}, revokedBy
 			count++
 		}
@@ -202,19 +247,26 @@ func (s *PlusSessionsStore) ClosePlusUserSessions(_ context.Context, revokedBy s
 	return count, nil
 }
 
-func (s *PlusSessionsStore) ClosePlusUserSession(_ context.Context, id uuid.UUID, revokedBy string, now time.Time) error {
+func (s *PlusSessionsStore) EndPlusUserSession(_ context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.Errors["ClosePlusUserSession"]; err != nil {
-		return err
+	if err := s.Errors["EndPlusUserSession"]; err != nil {
+		return false, err
 	}
 
-	if r, ok := s.Records[id]; ok && !r.RevokedAt.Valid {
-		r.RevokedAt, r.RevokedBy, r.ProcessedAt = sql.NullTime{Time: now, Valid: true}, revokedBy, sql.NullTime{Time: now, Valid: true}
+	r, ok := s.Records[id]
+	if !ok || r.Username != username || r.ProcessedAt.Valid {
+		return false, nil
 	}
 
-	return nil
+	if !r.RevokedAt.Valid {
+		r.RevokedAt, r.RevokedBy = sql.NullTime{Time: now, Valid: true}, revokedBy
+	}
+
+	r.ProcessedAt = sql.NullTime{Time: now, Valid: true}
+
+	return true, nil
 }
 
 func (s *PlusSessionsStore) LoadPlusUserSessionRevokedIDs(_ context.Context, since time.Time) (ids []uuid.UUID, err error) {
@@ -297,6 +349,16 @@ func (s *PlusSessionsStore) PurgePlusUserSessions(_ context.Context, revokedBefo
 			delete(s.Records, id)
 		}
 	}
+
+	grants := s.Grants[:0]
+
+	for _, g := range s.Grants {
+		if _, ok := s.Records[g.SessionID]; ok {
+			grants = append(grants, g)
+		}
+	}
+
+	s.Grants = grants
 
 	return nil
 }

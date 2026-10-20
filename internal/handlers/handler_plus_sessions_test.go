@@ -20,8 +20,10 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/authelia/authelia/v4/internal/authentication"
+	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/mocks"
 	"github.com/authelia/authelia/v4/internal/model"
+	"github.com/authelia/authelia/v4/internal/oidc"
 	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
 	"github.com/authelia/authelia/v4/internal/session"
 )
@@ -138,16 +140,16 @@ func TestPlusSessionsGET(t *testing.T) {
 	now := mock.Clock.Now()
 
 	mock.PlusSessionsStore.Records[other] = &model.PlusUserSession{
-		ID:          other,
-		Username:    testValue,
-		CreatedAt:   now,
-		LastActive:  now,
-		ExpiresAt:   now.Add(time.Hour),
-		IP:          "192.0.2.1",
-		UserAgent:   "Other",
-		RequestIDs:  `["secret-request-id"]`,
-		BackChannel: `{"sid":"secret-sid"}`,
+		ID:         other,
+		Username:   testValue,
+		CreatedAt:  now,
+		LastActive: now,
+		ExpiresAt:  now.Add(time.Hour),
+		IP:         "192.0.2.1",
+		UserAgent:  "Other",
 	}
+
+	mock.PlusSessionsStore.Grants = append(mock.PlusSessionsStore.Grants, model.PlusUserSessionGrant{SessionID: other, RequestID: "secret-request-id", ClientID: "app", Subject: "secret-subject", SID: "secret-sid"})
 
 	mock.Ctx.Response.Reset()
 
@@ -159,6 +161,7 @@ func TestPlusSessionsGET(t *testing.T) {
 
 	assert.NotContains(t, string(body), "secret-request-id")
 	assert.NotContains(t, string(body), "secret-sid")
+	assert.NotContains(t, string(body), "secret-subject")
 
 	var response struct {
 		Status string           `json:"status"`
@@ -222,18 +225,21 @@ func TestPlusSessionsOpenIDConnectAuthorization(t *testing.T) {
 
 		require.NotEmpty(t, query.Get(testOIDCFormParameterCode))
 
-		record := mock.PlusSessionsStore.Get(id)
+		grants, err := mock.PlusSessionsStore.LoadPlusUserSessionGrants(mock.Ctx, id)
 
-		require.NotNil(t, record)
-		assert.NotEmpty(t, record.RequestIDs)
-		assert.Contains(t, record.BackChannel, testOIDCAuthorizationCodeID)
+		require.NoError(t, err)
+		require.Len(t, grants, 1)
+		assert.NotEmpty(t, grants[0].RequestID)
+		assert.Equal(t, testOIDCAuthorizationCodeID, grants[0].ClientID)
+		assert.NotEmpty(t, grants[0].SID)
+		assert.NotEmpty(t, grants[0].Issuer)
 	})
 
 	t.Run("ShouldNotIssueCodeWhenRecordFails", func(t *testing.T) {
 		mock, _ := setup(t)
 		defer mock.Close()
 
-		mock.PlusSessionsStore.SetError("UpdatePlusUserSessionOpenIDConnect", errors.New("disk full"))
+		mock.PlusSessionsStore.SetError("SavePlusUserSessionGrant", errors.New("disk full"))
 
 		query := authorize(t, mock)
 
@@ -253,5 +259,177 @@ func TestPlusSessionsOpenIDConnectAuthorization(t *testing.T) {
 
 		assert.Empty(t, query.Get(testOIDCFormParameterCode))
 		assert.Equal(t, "server_error", query.Get("error"))
+	})
+}
+
+// Item 4: a re-authentication racing a revoke of the same session, which this instance hasn't polled yet, must not
+// carry the session over to a fresh record.
+func TestPlusSessionsReauthenticateRevokedElsewhere(t *testing.T) {
+	mock := mocks.NewMockAutheliaCtx(t)
+	defer mock.Close()
+
+	expectTestPlusPasswordSuccess(mock)
+
+	before := doTestPlusPasswordLogin(t, mock)
+
+	require.NotEqual(t, uuid.Nil, before.PlusID)
+
+	count, err := plussessions.RevokeUser(mock.Ctx, mock.PlusSessionsStore, testValue, mock.Clock.Now())
+
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+	require.False(t, mock.Ctx.Providers.PlusSessions.Revoked(before.PlusID), "the revoke must not have been polled yet")
+
+	mock.Ctx.Response.Reset()
+	mock.Ctx.Request.SetBodyString(`{"password":"hello"}`)
+
+	FirstFactorReauthenticatePOST(nil)(mock.Ctx)
+
+	mock.Assert401KO(t, "Authentication failed. Check your credentials.")
+	assert.Len(t, mock.PlusSessionsStore.Records, 1, "no replacement record may be created")
+
+	after, err := mock.Ctx.GetSession()
+
+	require.NoError(t, err)
+	assert.NotEqual(t, uuid.Nil, after.PlusID)
+	assert.Equal(t, before.PlusID, after.PlusID)
+}
+
+func TestPlusSessionsDeviceAuthorization(t *testing.T) {
+	setup := func(t *testing.T) (mock *mocks.MockAutheliaCtx, id uuid.UUID, values url.Values, consent *model.OAuth2ConsentSession) {
+		t.Helper()
+
+		mock = mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		require.NotEqual(t, uuid.Nil, userSession.PlusID)
+
+		config := newTestOIDCConfig(t)
+		config.Clients = []schema.IdentityProvidersOpenIDConnectClient{newTestOIDCDeviceCodeClient(t)}
+
+		setupTestOIDCProvider(t, mock, config)
+		setupTestOIDCDeviceCodeStore(t, mock)
+		setupTestOIDCSessionStore(t, mock)
+		setupTestOIDCSubjectStore(t, mock)
+		setupTestOIDCUserDetails(t, mock)
+
+		userCode := mustGetTestOIDCUserCode(t, mock)
+
+		consent = newTestOIDCConsentSession(t, mock, mustGetTestOIDCSubject(t, mock, testOIDCDeviceCodeID))
+		consent.ClientID = testOIDCDeviceCodeID
+		consent.Authorized = true
+		consent.GrantedScopes = model.StringSlicePipeDelimited{oidc.ScopeOpenID}
+
+		mock.StorageMock.EXPECT().
+			LoadOAuth2ConsentSessionByChallengeID(gomock.Any(), consent.ChallengeID).
+			AnyTimes().
+			Return(consent, nil)
+
+		return mock, userSession.PlusID, url.Values{
+			oidc.FormParameterUserCode: []string{userCode},
+			oidc.FormParameterFlowID:   []string{consent.ChallengeID.String()},
+		}, consent
+	}
+
+	t.Run("ShouldRecordGrant", func(t *testing.T) {
+		mock, id, values, consent := setup(t)
+		defer mock.Close()
+
+		mock.StorageMock.EXPECT().SaveOAuth2ConsentSessionGranted(gomock.Any(), consent.ID).Times(1).Return(nil)
+
+		rw, r := newTestOAuth2Request(t, fasthttp.MethodPut, testOIDCDeviceAuthorizationEndpoint, values)
+
+		OAuth2DeviceAuthorizationPUT(mock.Ctx, rw, r)
+
+		require.Equal(t, http.StatusOK, rw.Code)
+
+		grants, err := mock.PlusSessionsStore.LoadPlusUserSessionGrants(mock.Ctx, id)
+
+		require.NoError(t, err)
+		require.Len(t, grants, 1)
+		assert.NotEmpty(t, grants[0].RequestID)
+	})
+
+	t.Run("ShouldNotApproveWhenRecordFails", func(t *testing.T) {
+		mock, id, values, _ := setup(t)
+		defer mock.Close()
+
+		mock.PlusSessionsStore.SetError("SavePlusUserSessionGrant", errors.New("disk full"))
+
+		// No SaveOAuth2ConsentSessionGranted expectation is set, so approving the device fails the test.
+		rw, r := newTestOAuth2Request(t, fasthttp.MethodPut, testOIDCDeviceAuthorizationEndpoint, values)
+
+		OAuth2DeviceAuthorizationPUT(mock.Ctx, rw, r)
+
+		assert.NotEqual(t, http.StatusOK, rw.Code)
+		assert.Contains(t, rw.Body.String(), "server_error")
+
+		grants, err := mock.PlusSessionsStore.LoadPlusUserSessionGrants(mock.Ctx, id)
+
+		require.NoError(t, err)
+		assert.Empty(t, grants)
+	})
+}
+
+func TestPlusSessionsLogout(t *testing.T) {
+	setup := func(t *testing.T) (mock *mocks.MockAutheliaCtx, userSession session.UserSession) {
+		t.Helper()
+
+		mock = mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+
+		client := newTestOIDCAuthorizationCodeClient(t)
+		client.ConsentMode = "implicit"
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, client)
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+		require.NotEqual(t, uuid.Nil, userSession.PlusID)
+
+		return mock, userSession
+	}
+
+	t.Run("ShouldCloseRecordAndRevokeGrantsFromTheTable", func(t *testing.T) {
+		mock, userSession := setup(t)
+		defer mock.Close()
+
+		// Item 1: the grant is in the table but not in this copy of the session, as when a concurrent authorization's
+		// session save lost the race.
+		ok, err := mock.PlusSessionsStore.SavePlusUserSessionGrant(mock.Ctx, model.PlusUserSessionGrant{SessionID: userSession.PlusID, RequestID: "lost-request-id"})
+
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Nil(t, userSession.OpenIDConnect)
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"lost-request-id"}).Times(1).Return(nil)
+
+		oauth2Logout(mock.Ctx, &userSession)
+
+		record := mock.PlusSessionsStore.Get(userSession.PlusID)
+
+		require.NotNil(t, record)
+		assert.True(t, record.RevokedAt.Valid)
+		assert.True(t, record.ProcessedAt.Valid, "the processor must not revoke the grants again")
+		assert.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
+		assert.True(t, mock.Ctx.Providers.PlusSessions.Revoked(userSession.PlusID))
+	})
+
+	t.Run("ShouldNotRevokeGrantsOfClaimedRecord", func(t *testing.T) {
+		mock, userSession := setup(t)
+		defer mock.Close()
+
+		_, err := mock.PlusSessionsStore.SavePlusUserSessionGrant(mock.Ctx, model.PlusUserSessionGrant{SessionID: userSession.PlusID, RequestID: "request-id"})
+
+		require.NoError(t, err)
+
+		// Another instance revoked and processed the record already.
+		mock.PlusSessionsStore.Records[userSession.PlusID].RevokedAt.Valid = true
+		mock.PlusSessionsStore.Records[userSession.PlusID].ProcessedAt.Valid = true
+
+		// No storage expectation is set, so any revocation fails the test.
+		oauth2Logout(mock.Ctx, &userSession)
 	})
 }

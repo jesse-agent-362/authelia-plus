@@ -30,14 +30,15 @@ func (p *Provider) SetPlusSessions(plus PlusSessions) {
 }
 
 // plusRevoked reports whether the loaded user session was revoked, destroying it if so. The caller must treat the
-// session as anonymous whenever this returns true, even if destroying it failed. Sessions from before the records
-// existed have no PlusID; they can't be revoked this way and simply expire.
+// session as anonymous whenever this returns true, even if destroying it failed. Every authentication records the
+// session, so an authenticated session without a PlusID predates the records: it can't be revoked, so it's rejected
+// too, and its user logs in once more.
 func (p *Session) plusRevoked(ctx *fasthttp.RequestCtx, userSession *UserSession) bool {
-	if p.plus == nil || userSession.Username == "" || userSession.PlusID == uuid.Nil {
+	if p.plus == nil || userSession.Username == "" {
 		return false
 	}
 
-	if p.plus.Revoked(userSession.PlusID) {
+	if userSession.PlusID == uuid.Nil || p.plus.Revoked(userSession.PlusID) {
 		_ = p.sessionHolder.Destroy(ctx)
 
 		return true

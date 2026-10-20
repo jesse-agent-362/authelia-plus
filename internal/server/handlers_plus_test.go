@@ -16,6 +16,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"go.uber.org/mock/gomock"
 
+	"github.com/authelia/authelia/v4/internal/authorization"
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/middlewares"
 	"github.com/authelia/authelia/v4/internal/mocks"
@@ -49,6 +50,9 @@ func newTestPlusRouter(t *testing.T) *testPlusRouter {
 		},
 	}
 
+	config.AccessControl.DefaultPolicy = "one_factor"
+	config.AuthenticationBackend.RefreshInterval = schema.NewRefreshIntervalDurationNever()
+
 	config.Session.Cookies = []schema.SessionCookie{
 		{
 			SessionCookieCommon: schema.SessionCookieCommon{Name: "authelia_session", Expiration: time.Hour, Inactivity: time.Hour, SameSite: "lax"},
@@ -63,6 +67,7 @@ func newTestPlusRouter(t *testing.T) *testPlusRouter {
 	r.providers.Random = random.NewMathematical()
 	r.providers.Templates = tmpl
 	r.providers.StorageProvider = r.storage
+	r.providers.Authorizer = authorization.NewAuthorizer(config)
 	r.providers.SessionProvider = session.NewProvider(config.Session, nil)
 	r.providers.PlusSessions = plussessions.New(config, r.records, r.providers.Clock)
 	r.providers.SessionProvider.SetPlusSessions(r.providers.PlusSessions)
@@ -80,7 +85,17 @@ func (r *testPlusRouter) login(t *testing.T, username string, secondFactor bool)
 	s, err := r.providers.SessionProvider.Get("example.com")
 	require.NoError(t, err)
 
-	id, err = r.providers.PlusSessions.Create(context.Background(), username, "192.0.2.1", "ua", false, s.Config, "", uuid.Nil, nil)
+	id, err = r.providers.PlusSessions.Create(context.Background(), username, "192.0.2.1", "ua", false, s.Config, uuid.Nil, "")
+	require.NoError(t, err)
+
+	return id, r.save(t, username, secondFactor, id)
+}
+
+// save stores a session at the given level with the given record ID, and returns the cookie for it.
+func (r *testPlusRouter) save(t *testing.T, username string, secondFactor bool, id uuid.UUID) (cookie *fasthttp.Cookie) {
+	t.Helper()
+
+	s, err := r.providers.SessionProvider.Get("example.com")
 	require.NoError(t, err)
 
 	ctx := &fasthttp.RequestCtx{}
@@ -97,7 +112,28 @@ func (r *testPlusRouter) login(t *testing.T, username string, secondFactor bool)
 	cookie = fasthttp.AcquireCookie()
 	require.NoError(t, cookie.ParseBytes(ctx.Response.Header.PeekCookie("authelia_session")))
 
-	return id, cookie
+	return cookie
+}
+
+// authz asks the forward-auth endpoint whether the session may reach a one_factor resource.
+func (r *testPlusRouter) authz(cookie *fasthttp.Cookie) int {
+	ctx := &fasthttp.RequestCtx{}
+
+	ctx.Request.Header.SetMethod(fasthttp.MethodGet)
+	ctx.Request.SetRequestURI("/api/authz/forward-auth")
+	ctx.Request.Header.SetHost("auth.example.com")
+	ctx.Request.Header.Set(fasthttp.HeaderXForwardedProto, "https")
+	ctx.Request.Header.Set(fasthttp.HeaderXForwardedHost, "app.example.com")
+	ctx.Request.Header.Set("X-Forwarded-URI", "/")
+	ctx.Request.Header.Set("X-Forwarded-Method", fasthttp.MethodGet)
+
+	if cookie != nil {
+		ctx.Request.Header.SetCookieBytesKV(cookie.Key(), cookie.Value())
+	}
+
+	r.handler(ctx)
+
+	return ctx.Response.StatusCode()
 }
 
 func (r *testPlusRouter) do(method, path string, cookie *fasthttp.Cookie) *fasthttp.RequestCtx {
@@ -123,6 +159,8 @@ func TestHandlerMainPlusSessions(t *testing.T) {
 
 	id, cookie := r.login(t, "john", true)
 	other, _ := r.login(t, "harry", true)
+
+	assert.Equal(t, fasthttp.StatusOK, r.authz(cookie))
 
 	ctx := r.do(fasthttp.MethodGet, "/api/plus/sessions", cookie)
 	assert.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
@@ -162,6 +200,21 @@ func TestHandlerMainPlusSessions(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
 
 	ctx = r.do(fasthttp.MethodGet, "/api/user/info", cookie)
+	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
+
+	// The same goes for the authz endpoint.
+	assert.Equal(t, fasthttp.StatusUnauthorized, r.authz(cookie))
+}
+
+// Item 3: an authenticated session saved before the records existed has no record to revoke, so it's anonymous.
+func TestHandlerMainPlusSessionsAuthzWithoutRecord(t *testing.T) {
+	r := newTestPlusRouter(t)
+
+	cookie := r.save(t, "john", true, uuid.Nil)
+
+	assert.Equal(t, fasthttp.StatusUnauthorized, r.authz(cookie))
+
+	ctx := r.do(fasthttp.MethodGet, "/api/user/info", cookie)
 	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
 }
 

@@ -6,7 +6,6 @@ package sessions
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -23,8 +22,8 @@ import (
 	"github.com/authelia/authelia/v4/internal/session"
 )
 
-// ErrRecordUnavailable is returned when a user session record can no longer take OpenID Connect 1.0 state, because it
-// is missing or its revocation is being processed.
+// ErrRecordUnavailable is returned when a user session record can no longer take a grant or be replaced, because it is
+// missing, revoked or its revocation is being processed.
 var ErrRecordUnavailable = errors.New("the user session record is missing or revoked")
 
 // New returns a Manager for the user session records in store.
@@ -128,44 +127,54 @@ func (m *Manager) Touch(userSession *session.UserSession, config schema.SessionC
 }
 
 // Create records a new user session and returns its ID. The caller must not authenticate the session if this fails.
-// The OpenID Connect 1.0 state of the session, if any, moves to the new record, and the previous record, if any, is
-// closed without side effects: its session is the one being replaced.
-func (m *Manager) Create(ctx context.Context, username, ip, userAgent string, keepMeLoggedIn bool, config schema.SessionCookie, issuer string, previous uuid.UUID, logout *session.OpenIDConnectLogout) (id uuid.UUID, err error) {
+//
+// A session already authenticated as the same user is a re-authentication: its record is replaced atomically, and its
+// grants move to the new record. That fails with ErrRecordUnavailable if the record was revoked or claimed meanwhile,
+// so a revoke landing at the same moment can't be escaped. A session authenticated as another user is a switch: the
+// other user's record is revoked as on a logout, grants and all.
+func (m *Manager) Create(ctx context.Context, username, ip, userAgent string, keepMeLoggedIn bool, config schema.SessionCookie, previous uuid.UUID, previousUsername string) (id uuid.UUID, err error) {
 	if id, err = uuid.NewV7(); err != nil {
 		return uuid.Nil, fmt.Errorf("error generating user session record id: %w", err)
 	}
 
 	now := m.clock.Now().UTC()
 
-	if err = m.store.SavePlusUserSession(ctx, model.PlusUserSession{
-		ID:          id,
-		Username:    username,
-		CreatedAt:   now,
-		LastActive:  now,
-		ExpiresAt:   now.Add(lifetime(config, keepMeLoggedIn)),
-		IP:          truncate(ip, MaxIP),
-		UserAgent:   truncate(userAgent, MaxUserAgent),
-		RequestIDs:  "[]",
-		BackChannel: "{}",
-	}); err != nil {
+	record := model.PlusUserSession{
+		ID:         id,
+		Username:   username,
+		CreatedAt:  now,
+		LastActive: now,
+		ExpiresAt:  now.Add(lifetime(config, keepMeLoggedIn)),
+		IP:         truncate(ip, MaxIP),
+		UserAgent:  truncate(userAgent, MaxUserAgent),
+	}
+
+	switch {
+	case previous == uuid.Nil:
+		err = m.store.SavePlusUserSession(ctx, record)
+	case previousUsername == username:
+		var ok bool
+
+		if ok, err = m.store.ReplacePlusUserSession(ctx, previous, record, RevokedByReplace); err == nil && !ok {
+			err = ErrRecordUnavailable
+		}
+
+		if err == nil {
+			m.markRevoked(previous, now)
+		}
+	default:
+		if _, err = m.revoke(ctx, previous, previousUsername, RevokedBySwitch); err == nil {
+			err = m.store.SavePlusUserSession(ctx, record)
+		}
+	}
+
+	if err != nil {
 		return uuid.Nil, err
 	}
 
 	m.muTouched.Lock()
 	m.touched[id] = now
 	m.muTouched.Unlock()
-
-	if logout != nil {
-		if err = m.RecordOpenIDConnect(ctx, id, issuer, logout); err != nil {
-			return uuid.Nil, err
-		}
-	}
-
-	if previous != uuid.Nil {
-		if err = m.store.ClosePlusUserSession(ctx, previous, RevokedByReplace, now); err != nil {
-			return uuid.Nil, err
-		}
-	}
 
 	return id, nil
 }
@@ -178,56 +187,20 @@ func (m *Manager) List(ctx context.Context, username string) (records []model.Pl
 // Revoke revokes the record with this ID if it is an unrevoked record of username, and reports whether it did. The
 // session is rejected by this instance immediately.
 func (m *Manager) Revoke(ctx context.Context, id uuid.UUID, username string) (ok bool, err error) {
-	now := m.clock.Now().UTC()
-
-	if ok, err = m.store.RevokePlusUserSession(ctx, id, username, RevokedBySelf, now); err != nil || !ok {
-		return ok, err
-	}
-
-	m.mu.Lock()
-	m.revoked[id] = now
-	m.mu.Unlock()
-
-	return true, nil
+	return m.revoke(ctx, id, username, RevokedBySelf)
 }
 
-// RecordOpenIDConnect mirrors the OpenID Connect 1.0 logout state of the session onto its record, so its grants can be
-// revoked without the session. It returns ErrRecordUnavailable when the record is revoked or missing, in which case
-// the caller must not issue the grant.
-func (m *Manager) RecordOpenIDConnect(ctx context.Context, id uuid.UUID, issuer string, logout *session.OpenIDConnectLogout) (err error) {
-	if m.Revoked(id) {
+// RecordGrant adds an OAuth 2.0 authorization request to the record of the session it was made in, so revoking the
+// session can revoke its tokens. It returns ErrRecordUnavailable when the record is revoked, claimed or missing, in
+// which case the caller must not issue the grant.
+func (m *Manager) RecordGrant(ctx context.Context, grant model.PlusUserSessionGrant) (err error) {
+	if m.Revoked(grant.SessionID) {
 		return ErrRecordUnavailable
-	}
-
-	state := OpenIDConnectState{RequestIDs: logout.RequestIDs, SessionID: logout.SessionID}
-
-	if state.RequestIDs == nil {
-		state.RequestIDs = []string{}
-	}
-
-	if len(logout.Clients) != 0 {
-		state.Issuer = issuer
-
-		for _, c := range logout.Clients {
-			state.Clients = append(state.Clients, OpenIDConnectClient{ClientID: c.ClientID, Subject: c.Subject})
-		}
-	}
-
-	var requestIDs, backChannel []byte
-
-	if requestIDs, err = json.Marshal(state.RequestIDs); err != nil {
-		return err
-	}
-
-	state.RequestIDs = nil
-
-	if backChannel, err = json.Marshal(state); err != nil {
-		return err
 	}
 
 	var ok bool
 
-	if ok, err = m.store.UpdatePlusUserSessionOpenIDConnect(ctx, id, string(requestIDs), string(backChannel)); err != nil {
+	if ok, err = m.store.SavePlusUserSessionGrant(ctx, grant); err != nil {
 		return err
 	}
 
@@ -238,7 +211,47 @@ func (m *Manager) RecordOpenIDConnect(ctx context.Context, id uuid.UUID, issuer 
 	return nil
 }
 
-// RevokeUser revokes every session record of a user, and returns how many it revoked. It only writes the store: the
+// End claims the record of a session being logged out, and returns its grants for the caller to revoke. It reports
+// false when the record is missing or was claimed already, by another logout or by an instance processing its revoke;
+// the grants are then not the caller's to act on. A claimed record's session is rejected by this instance immediately.
+func (m *Manager) End(ctx context.Context, id uuid.UUID, username string) (grants []model.PlusUserSessionGrant, ok bool, err error) {
+	now := m.clock.Now().UTC()
+
+	if ok, err = m.store.EndPlusUserSession(ctx, id, username, RevokedByLogout, now); err != nil || !ok {
+		return nil, ok, err
+	}
+
+	m.markRevoked(id, now)
+
+	// Released on failure, so an instance processes the revocation, grants and all, in the background instead.
+	if grants, err = m.store.LoadPlusUserSessionGrants(ctx, id); err != nil {
+		m.unclaim(ctx, id)
+
+		return nil, false, err
+	}
+
+	return grants, true, nil
+}
+
+func (m *Manager) revoke(ctx context.Context, id uuid.UUID, username, revokedBy string) (ok bool, err error) {
+	now := m.clock.Now().UTC()
+
+	if ok, err = m.store.RevokePlusUserSession(ctx, id, username, revokedBy, now); err != nil || !ok {
+		return ok, err
+	}
+
+	m.markRevoked(id, now)
+
+	return true, nil
+}
+
+func (m *Manager) markRevoked(id uuid.UUID, now time.Time) {
+	m.mu.Lock()
+	m.revoked[id] = now
+	m.mu.Unlock()
+}
+
+// RevokeUser revokes every session record of a user, matching the username exactly, and returns how many it revoked. It only writes the store: the
 // running instances reject the sessions and process the revocations on their next poll.
 func RevokeUser(ctx context.Context, store Store, username string, now time.Time) (count int64, err error) {
 	if err = store.PlusUserSessionsSchemaEnsure(ctx); err != nil {

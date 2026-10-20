@@ -224,6 +224,18 @@ func OAuth2DeviceAuthorizationPUT(ctx *middlewares.AutheliaCtx, rw http.Response
 		session.Claims.Audience = append([]string{client.GetID()}, oauthelia2.JoinGrantedAudienceAndResource(requester.GetGrantedAudience(), requester.GetGrantedResource())...)
 	}
 
+	// authelia-plus: the approval is recorded against the session first, so revoking the session revokes the device's
+	// tokens too.
+	if err = plusSessionsRecordGrant(ctx, &userSession, model.PlusUserSessionGrant{RequestID: requester.GetID()}); err != nil {
+		log.
+			WithError(err).
+			Error("Device Authorization Request failed to record the authorization to the session record during the User Authorization Flow")
+
+		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, oauthelia2.ErrServerError.WithHint("Could not record the user session."))
+
+		return
+	}
+
 	requester.SetStatus(oauthelia2.DeviceAuthorizeStatusApproved)
 
 	if responder, err = ctx.Providers.OpenIDConnect.NewRFC8628UserAuthorizeResponse(ctx, requester, session); err != nil {

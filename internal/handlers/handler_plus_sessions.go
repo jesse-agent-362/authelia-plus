@@ -20,6 +20,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/oidc"
 	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
 	"github.com/authelia/authelia/v4/internal/session"
+	"github.com/authelia/authelia/v4/internal/storage"
 )
 
 // authelia-plus: listing and revoking the user's own sessions.
@@ -146,21 +147,9 @@ func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCooki
 		return errPlusSessionsUnavailable
 	}
 
-	issuer := ""
-
-	if userSession.OpenIDConnect != nil && len(userSession.OpenIDConnect.Clients) != 0 {
-		var u *url.URL
-
-		if u, err = ctx.IssuerURL(); err != nil {
-			return err
-		}
-
-		issuer = u.String()
-	}
-
 	var id uuid.UUID
 
-	if id, err = ctx.Providers.PlusSessions.Create(ctx, username, ctx.RemoteIP().String(), string(ctx.UserAgent()), keepMeLoggedIn, config, issuer, userSession.PlusID, userSession.OpenIDConnect); err != nil {
+	if id, err = ctx.Providers.PlusSessions.Create(ctx, username, ctx.RemoteIP().String(), string(ctx.UserAgent()), keepMeLoggedIn, config, userSession.PlusID, userSession.Username); err != nil {
 		return err
 	}
 
@@ -169,56 +158,87 @@ func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCooki
 	return nil
 }
 
-// plusSessionsRecordOpenIDConnect mirrors the session's OpenID Connect 1.0 logout state onto its record, so a revoke
-// can revoke the grants without the session. The authorization must fail if it returns an error. Sessions from before
-// the records existed have none to record onto.
-func plusSessionsRecordOpenIDConnect(ctx *middlewares.AutheliaCtx, userSession *session.UserSession) (err error) {
-	if userSession.PlusID == uuid.Nil || userSession.OpenIDConnect == nil {
-		return nil
-	}
-
+// plusSessionsRecordGrant adds an authorization request made in the session to the session's record, so revoking the
+// session revokes the request's tokens. The authorization must fail if it returns an error.
+func plusSessionsRecordGrant(ctx *middlewares.AutheliaCtx, userSession *session.UserSession, grant model.PlusUserSessionGrant) (err error) {
 	if ctx.Providers.PlusSessions == nil {
 		return errPlusSessionsUnavailable
 	}
 
-	var issuer *url.URL
-
-	if issuer, err = ctx.IssuerURL(); err != nil {
-		return err
+	if userSession.PlusID == uuid.Nil {
+		return plussessions.ErrRecordUnavailable
 	}
 
-	return ctx.Providers.PlusSessions.RecordOpenIDConnect(ctx, userSession.PlusID, issuer.String(), userSession.OpenIDConnect)
+	grant.SessionID = userSession.PlusID
+
+	return ctx.Providers.PlusSessions.RecordGrant(ctx, grant)
+}
+
+// plusSessionsRevokeGrants revokes every token descended from the grants, and sends a Logout Token to each of their
+// Back-Channel Logout clients. Each group of clients is sent the 'sid' and issuer its ID Tokens were issued with;
+// newContext returns the Context the delivery runs in for an issuer.
+func plusSessionsRevokeGrants(ctx context.Context, provider *oidc.OpenIDConnectProvider, store storage.Provider, logger *logrus.Entry, newContext func(issuer string) (oidc.Context, context.CancelFunc, error), username string, grants []model.PlusUserSessionGrant) (err error) {
+	type group struct{ issuer, sid string }
+
+	var (
+		requestIDs = make([]string, 0, len(grants))
+		groups     []group
+		clients    = map[group][]session.OpenIDConnectLogoutClient{}
+		seen       = map[session.OpenIDConnectLogoutClient]bool{}
+	)
+
+	for _, grant := range grants {
+		if grant.RequestID != "" {
+			requestIDs = append(requestIDs, grant.RequestID)
+		}
+
+		if grant.ClientID == "" {
+			continue
+		}
+
+		c := session.OpenIDConnectLogoutClient{ClientID: grant.ClientID, Subject: grant.Subject}
+		g := group{issuer: grant.Issuer, sid: grant.SID}
+
+		if seen[c] {
+			continue
+		}
+
+		seen[c] = true
+
+		if _, ok := clients[g]; !ok {
+			groups = append(groups, g)
+		}
+
+		clients[g] = append(clients[g], c)
+	}
+
+	// The Logout Tokens are sent even if revoking the tokens failed, so the clients end their sessions either way.
+	err = store.RevokeOAuth2SessionsByRequestIDs(ctx, requestIDs)
+
+	for _, g := range groups {
+		oauth2BackChannelLogout(ctx, provider, logger, func() (oidc.Context, context.CancelFunc, error) {
+			return newContext(g.issuer)
+		}, username, g.sid, clients[g])
+	}
+
+	return err
 }
 
 // NewPlusSessionsProcessor returns the side effects of a revoked session: its OpenID Connect 1.0 grants are revoked
 // and its Back-Channel Logout clients are sent a Logout Token, as on logout.
 func NewPlusSessionsProcessor(providers *middlewares.Providers, config *schema.Configuration, logger *logrus.Entry) plussessions.Processor {
-	return func(ctx context.Context, record *model.PlusUserSession, state *plussessions.OpenIDConnectState) (err error) {
+	return func(ctx context.Context, record *model.PlusUserSession, grants []model.PlusUserSessionGrant) (err error) {
 		if providers.OpenIDConnect == nil {
 			return nil
 		}
 
-		if err = providers.StorageProvider.RevokeOAuth2SessionsByRequestIDs(ctx, state.RequestIDs); err != nil {
-			return err
-		}
-
-		if len(state.Clients) == 0 {
-			return nil
-		}
-
-		clients := make([]session.OpenIDConnectLogoutClient, 0, len(state.Clients))
-
-		for _, c := range state.Clients {
-			clients = append(clients, session.OpenIDConnectLogoutClient{ClientID: c.ClientID, Subject: c.Subject})
-		}
-
-		oauth2BackChannelLogout(ctx, providers.OpenIDConnect, logger, func() (oidc.Context, context.CancelFunc, error) {
-			issuer, err := url.Parse(state.Issuer)
-			if err != nil || state.Issuer == "" {
+		return plusSessionsRevokeGrants(ctx, providers.OpenIDConnect, providers.StorageProvider, logger, func(issuer string) (oidc.Context, context.CancelFunc, error) {
+			u, err := url.Parse(issuer)
+			if err != nil || issuer == "" {
 				return nil, nil, errors.New("the issuer is missing or invalid")
 			}
 
-			dctx, cancel := oidc.NewDetachedContextFromProviders(issuer, oidc.DetachedContextProviders{
+			dctx, cancel := oidc.NewDetachedContextFromProviders(u, oidc.DetachedContextProviders{
 				Clock:    providers.Clock,
 				Random:   providers.Random,
 				Config:   config,
@@ -228,8 +248,6 @@ func NewPlusSessionsProcessor(providers *middlewares.Providers, config *schema.C
 			}, backChannelLogoutTimeout)
 
 			return dctx, cancel, nil
-		}, record.Username, state.SessionID, clients)
-
-		return nil
+		}, record.Username, grants)
 	}
 }

@@ -156,17 +156,36 @@ func TestPlusSessionShouldRejectRevokedSessionWhenDestroyFails(t *testing.T) {
 	}
 }
 
-func TestPlusSessionShouldIgnoreSessionsWithoutRecord(t *testing.T) {
+// An authenticated session without a record predates the records, and could never be revoked: a stolen long-lived
+// cookie would survive revoking every session of its user. It's rejected instead.
+func TestPlusSessionShouldRejectAuthenticatedSessionsWithoutRecord(t *testing.T) {
 	s, plus := newTestPlusSession(t, false)
-
-	plus.revoked[uuid.Nil] = true
 
 	ctx := testPlusSessionRequest(t, s, uuid.Nil)
 
 	userSession, err := s.GetSession(ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, "john", userSession.Username)
+	assert.True(t, userSession.IsAnonymous())
+	assert.Empty(t, plus.touched)
+}
+
+func TestPlusSessionShouldKeepAnonymousSessionsWithoutRecord(t *testing.T) {
+	s, plus := newTestPlusSession(t, false)
+
+	ctx := &fasthttp.RequestCtx{}
+
+	anonymous, err := s.GetSession(ctx)
+	require.NoError(t, err)
+
+	anonymous.LastActivity = 42
+
+	require.NoError(t, s.SaveSession(ctx, anonymous))
+
+	userSession, err := s.GetSession(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(42), userSession.LastActivity, "an anonymous session is left alone")
 	assert.Empty(t, plus.touched)
 }
 

@@ -6,7 +6,6 @@ package sessions
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -119,25 +118,21 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 		return
 	}
 
-	// Loaded after the claim: the claim stops any further OpenID Connect 1.0 state being recorded, so this copy has
-	// every grant of the session.
+	// Loaded after the claim: the claim stops any further grant being added, so this is every grant of the session.
 	record, err := m.store.LoadPlusUserSession(pctx, id)
 	if err != nil || record == nil {
-		m.log.WithError(err).Errorf("Error occurred loading the revoked user session '%s'", id)
+		m.log.WithError(err).Errorf("Error occurred loading the revoked user session '%s', it will be retried", id)
 
 		m.unclaim(ctx, id)
 
 		return
 	}
 
-	state := &OpenIDConnectState{}
+	grants, err := m.store.LoadPlusUserSessionGrants(pctx, id)
+	if err != nil {
+		m.log.WithError(err).Errorf("Error occurred loading the grants of the revoked user session '%s', it will be retried", id)
 
-	if err = json.Unmarshal([]byte(record.BackChannel), state); err != nil {
-		m.log.WithError(err).Warnf("The Back-Channel Logout state of the revoked user session '%s' could not be decoded", id)
-	}
-
-	if err = json.Unmarshal([]byte(record.RequestIDs), &state.RequestIDs); err != nil {
-		m.log.WithError(err).Errorf("The authorization requests of the revoked user session '%s' could not be decoded", id)
+		m.unclaim(ctx, id)
 
 		return
 	}
@@ -146,7 +141,7 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 		return
 	}
 
-	if err = m.processor(ctx, record, state); err != nil {
+	if err = m.processor(ctx, record, grants); err != nil {
 		m.log.WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 grants of the revoked user session '%s', it will be retried", id)
 
 		m.unclaim(ctx, id)
