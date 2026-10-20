@@ -206,6 +206,40 @@ func TestHandlerMainPlusSessions(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusUnauthorized, r.authz(cookie))
 }
 
+func TestHandlerMainPlusSessionsRevokeOthers(t *testing.T) {
+	r := newTestPlusRouter(t)
+
+	current, cookie := r.login(t, "john", true)
+	other, otherCookie := r.login(t, "john", true)
+	hidden, hiddenCookie := r.login(t, "john", true)
+	harry, harryCookie := r.login(t, "harry", true)
+
+	// Live, but left looking expired by a lagging activity write, so the list hides it.
+	r.records.Records[hidden].ExpiresAt = time.Now().Add(-time.Hour)
+
+	ctx := r.do(fasthttp.MethodGet, "/api/plus/sessions", cookie)
+	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
+	require.NotContains(t, string(ctx.Response.Body()), hidden.String())
+
+	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions", cookie)
+	assert.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
+	assert.JSONEq(t, `{"status":"OK","data":{"count":2}}`, string(ctx.Response.Body()))
+	assert.Empty(t, ctx.Response.Header.Peek(fasthttp.HeaderAccessControlAllowOrigin))
+
+	assert.Equal(t, fasthttp.StatusOK, r.authz(cookie), "the current session survives")
+	assert.Equal(t, fasthttp.StatusUnauthorized, r.authz(otherCookie))
+	assert.Equal(t, fasthttp.StatusUnauthorized, r.authz(hiddenCookie), "a session hidden from the list is revoked too")
+	assert.Equal(t, fasthttp.StatusOK, r.authz(harryCookie), "another user's sessions are untouched")
+
+	assert.False(t, r.records.Get(current).RevokedAt.Valid)
+	assert.True(t, r.records.Get(other).RevokedAt.Valid)
+	assert.False(t, r.records.Get(harry).RevokedAt.Valid)
+
+	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions", cookie)
+	assert.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
+	assert.JSONEq(t, `{"status":"OK","data":{"count":0}}`, string(ctx.Response.Body()))
+}
+
 // Item 3: an authenticated session saved before the records existed has no record to revoke, so it's anonymous.
 func TestHandlerMainPlusSessionsAuthzWithoutRecord(t *testing.T) {
 	r := newTestPlusRouter(t)
@@ -224,7 +258,9 @@ func TestHandlerMainPlusSessionsRequireFullAuth(t *testing.T) {
 
 	id, cookie := r.login(t, "john", false)
 
-	r.storage.EXPECT().LoadUserInfo(gomock.Any(), "john").Return(model.UserInfo{HasTOTP: true}, nil).Times(2)
+	other, _ := r.login(t, "john", true)
+
+	r.storage.EXPECT().LoadUserInfo(gomock.Any(), "john").Return(model.UserInfo{HasTOTP: true}, nil).Times(3)
 
 	ctx := r.do(fasthttp.MethodGet, "/api/plus/sessions", cookie)
 	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
@@ -233,6 +269,13 @@ func TestHandlerMainPlusSessionsRequireFullAuth(t *testing.T) {
 	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions/"+id.String(), cookie)
 	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
 	assert.False(t, r.records.Get(id).RevokedAt.Valid)
+
+	secondFactor := string(ctx.Response.Body())
+
+	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions", cookie)
+	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
+	assert.Equal(t, secondFactor, string(ctx.Response.Body()), "the same 403 envelope as the single revoke")
+	assert.False(t, r.records.Get(other).RevokedAt.Valid)
 
 	ctx = r.do(fasthttp.MethodGet, "/api/plus/sessions", nil)
 	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())

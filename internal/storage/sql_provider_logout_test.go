@@ -50,7 +50,17 @@ func TestSQLProviderRevokeOAuth2SessionsByRequestIDs(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, provider.RevokeOAuth2SessionsByRequestIDs(ctx, []string{"req-a", "req-b"}))
+	// More request IDs than one statement takes, with the two that exist in different statements.
+	requestIDs := make([]string, 0, 2*revokeRequestIDsBatch+2)
+	requestIDs = append(requestIDs, "req-a")
+
+	for i := range 2 * revokeRequestIDsBatch {
+		requestIDs = append(requestIDs, fmt.Sprintf("req-unknown-%d", i))
+	}
+
+	requestIDs = append(requestIDs, "req-b")
+
+	require.NoError(t, provider.RevokeOAuth2SessionsByRequestIDs(ctx, requestIDs))
 
 	for _, sessionType := range types {
 		t.Run(sessionType.String(), func(t *testing.T) {

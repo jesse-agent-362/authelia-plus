@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -483,6 +484,92 @@ func TestOAuth2EndSession(t *testing.T) {
 			testOIDCFormParameterIDTokenHint:           []string{hint},
 			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
 		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assertLoggedIn(t, mock, true)
+	})
+
+	t.Run("ShouldNotLogoutWithIDTokenHintFromAnEarlierSession", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		userSession.FirstFactorAuthnTimestamp = time.Now().Add(time.Minute).Unix()
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			testOIDCFormParameterIDTokenHint:           []string{hint},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assertLoggedIn(t, mock, true)
+	})
+
+	t.Run("ShouldNotLogoutWithIDTokenHintForAnotherSessionID", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		_, claims := mustDecodeTestJWT(t, hint)
+		require.NotEmpty(t, claims[oidc.ClaimSessionID])
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+		require.NotNil(t, userSession.OpenIDConnect)
+
+		userSession.OpenIDConnect.SessionID = "another-session"
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assert.Empty(t, receiver.Tokens())
+		assertLoggedIn(t, mock, true)
+	})
+
+	t.Run("ShouldNotLogoutWithLogoutTokenAsHint", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		mustGetTestOIDCIDToken(t, mock)
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		oauth2Logout(mock.Ctx, &userSession)
+
+		require.Len(t, receiver.Tokens(), 1)
+
+		hint := receiver.Tokens()[0]
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
 
 		assert.Equal(t, http.StatusFound, code)
 		assert.Equal(t, testOIDCPortalURL, location)

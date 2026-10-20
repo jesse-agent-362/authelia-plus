@@ -251,7 +251,7 @@ func TestShouldLoadRevokedSetAtStartup(t *testing.T) {
 func TestShouldFailStartupWhenRevokedSetFails(t *testing.T) {
 	m, store, _ := newTestManager(t, true)
 
-	store.SetError("LoadPlusUserSessionRevokedIDs", errTest)
+	store.SetError("LoadPlusUserSessionRevocations", errTest)
 
 	assert.ErrorIs(t, m.StartupCheck(), errTest)
 }
@@ -268,7 +268,7 @@ func TestShouldKeepRevokedSetWhenRefreshFails(t *testing.T) {
 	require.NoError(t, m.StartupCheck())
 	require.True(t, m.Revoked(id))
 
-	store.SetError("LoadPlusUserSessionRevokedIDs", errTest)
+	store.SetError("LoadPlusUserSessionRevocations", errTest)
 
 	c.Set(c.Now().Add(time.Minute))
 
@@ -298,7 +298,8 @@ func TestShouldKeepRevokedIDForRetention(t *testing.T) {
 
 	assert.True(t, m.Revoked(id))
 
-	c.Set(c.Now().Add(2 * time.Minute))
+	// Forgotten on the next reload of the whole retention.
+	c.Set(c.Now().Add(PurgeInterval))
 	m.Poll(context.Background())
 
 	assert.False(t, m.Revoked(id))
@@ -466,6 +467,7 @@ func TestShouldRetryRevocationWhenGrantsFailToLoad(t *testing.T) {
 
 	store.SetError("LoadPlusUserSessionGrants", nil)
 
+	c.Set(c.Now().Add(RetryBase))
 	m.Poll(context.Background())
 
 	assert.Equal(t, int32(1), calls.Load())
@@ -494,9 +496,123 @@ func TestShouldRetryRevocationWhenProcessingFails(t *testing.T) {
 
 	m.Poll(context.Background())
 	m.Poll(context.Background())
+
+	assert.Equal(t, int32(1), calls.Load(), "a failed revocation waits for its backoff")
+
+	c.Set(c.Now().Add(RetryBase))
+	m.Poll(context.Background())
 	m.Poll(context.Background())
 
 	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestShouldBackOffFailingRevocations(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		return errTest
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	for attempt, wait := range []time.Duration{RetryBase, 2 * RetryBase, 4 * RetryBase} {
+		m.Poll(context.Background())
+
+		record := store.Get(id)
+
+		assert.Equal(t, attempt+1, record.Attempts)
+		assert.Equal(t, c.Now().UTC().Add(wait), record.RetryAt.Time.UTC(), "attempt %d", attempt+1)
+
+		c.Set(record.RetryAt.Time)
+	}
+
+	assert.Equal(t, time.Hour, Backoff(20), "the backoff is capped")
+}
+
+func TestShouldBoundProcessingOfOneRevocation(t *testing.T) {
+	m, _, c := newTestManager(t, true)
+
+	var remaining time.Duration
+
+	m.SetProcessor(func(pctx context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		deadline, ok := pctx.Deadline()
+		require.True(t, ok, "the processor runs with a deadline")
+
+		remaining = time.Until(deadline)
+
+		return nil
+	})
+
+	id := testCreate(t, m)
+
+	_, err := m.Revoke(context.Background(), id, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	m.Poll(context.Background())
+
+	assert.Positive(t, remaining)
+	assert.LessOrEqual(t, remaining, ProcessTimeout)
+	assert.Less(t, ProcessTimeout, ClaimLease, "a revocation is done or abandoned before another instance takes it over")
+}
+
+func TestShouldRefreshIncrementally(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	start := c.Now().UTC()
+
+	require.NoError(t, m.StartupCheck())
+
+	other := testCreate(t, m)
+
+	// Revoked by another instance.
+	revokedAt := start.Add(time.Minute)
+
+	_, err := store.RevokePlusUserSession(context.Background(), other, "john", RevokedByCLI, revokedAt)
+	require.NoError(t, err)
+
+	c.Set(start.Add(2 * time.Minute))
+	m.Poll(context.Background())
+
+	assert.True(t, m.Revoked(other))
+
+	c.Set(start.Add(3 * time.Minute))
+	m.Poll(context.Background())
+
+	c.Set(start.Add(PurgeInterval))
+	m.Poll(context.Background())
+
+	assert.Equal(t, []time.Time{
+		start.Add(-m.Retention()),
+		start.Add(-m.Retention()).Add(2 * time.Minute),
+		revokedAt.Add(-RefreshOverlap),
+		start.Add(PurgeInterval).Add(-m.Retention()),
+	}, store.RevocationsSince, "the whole retention at startup and every PurgeInterval, else from the latest revocation seen")
+}
+
+func TestShouldRevokeOtherSessions(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	current, other := testCreate(t, m), testCreate(t, m)
+
+	harry, err := m.Create(context.Background(), "harry", "192.0.2.1", "Mozilla/5.0", false, testCookie(), uuid.Nil, "")
+	require.NoError(t, err)
+
+	count, err := m.RevokeOthers(context.Background(), "john", current)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
+
+	assert.True(t, m.Revoked(other), "rejected here at once")
+	assert.False(t, m.Revoked(current))
+	assert.False(t, m.Revoked(harry))
+	assert.Equal(t, RevokedBySelf, store.Get(other).RevokedBy)
+	assert.False(t, store.Get(other).ProcessedAt.Valid, "processed by the poller")
 }
 
 // Item 2: an instance shutting down mid-processing cancels the context the processor runs in; the claim is still
@@ -532,6 +648,7 @@ func TestShouldReleaseClaimWhenShutDownMidProcessing(t *testing.T) {
 	assert.False(t, store.Get(id).ProcessedAt.Valid)
 	assert.False(t, store.Get(id).ClaimedAt.Valid, "the claim is released despite the shutdown")
 
+	c.Set(c.Now().Add(RetryBase))
 	m.Poll(context.Background())
 
 	assert.Equal(t, int32(2), calls.Load())
@@ -636,6 +753,51 @@ func TestShouldWriteActivityInRun(t *testing.T) {
 
 	assert.Equal(t, c.Now().UTC().Add(24*time.Hour), store.Get(id).ExpiresAt)
 
+	cancel()
+	<-done
+}
+
+func TestShouldRefreshWhileProcessingIsStuck(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	m.SetPollInterval(10 * time.Millisecond)
+
+	stuck, release := make(chan struct{}), make(chan struct{})
+
+	m.SetProcessor(func(_ context.Context, _ *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		close(stuck)
+		<-release
+
+		return nil
+	})
+
+	slow, other := testCreate(t, m), testCreate(t, m)
+
+	require.NoError(t, m.StartupCheck())
+
+	_, err := m.Revoke(context.Background(), slow, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+
+	go func() {
+		m.Run(ctx)
+		close(done)
+	}()
+
+	<-stuck
+
+	// Revoked by another instance while this one's processing hangs.
+	_, err = store.RevokePlusUserSession(context.Background(), other, "john", RevokedByCLI, c.Now().UTC())
+	require.NoError(t, err)
+
+	assert.Eventually(t, func() bool { return m.Revoked(other) }, 5*time.Second, 10*time.Millisecond, "the refresh doesn't wait for the processing")
+
+	close(release)
 	cancel()
 	<-done
 }

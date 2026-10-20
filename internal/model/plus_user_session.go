@@ -34,6 +34,20 @@ type PlusUserSession struct {
 	// ClaimedAt is when an instance leased the revocation for processing; ProcessedAt is when it finished.
 	ClaimedAt   sql.NullTime `db:"claimed_at"`
 	ProcessedAt sql.NullTime `db:"processed_at"`
+
+	// Attempts counts the claims of the revocation; a failed one isn't retried before RetryAt.
+	Attempts int          `db:"attempts"`
+	RetryAt  sql.NullTime `db:"retry_at"`
+}
+
+// PlusUserSessionMaxGrants is the most grants a user session record takes. Revoking a session revokes all of its
+// grants at once, so this bounds the work one revocation can cause.
+const PlusUserSessionMaxGrants = 1000
+
+// PlusUserSessionRevocation is the ID and revocation time of a revoked user session record.
+type PlusUserSessionRevocation struct {
+	ID        uuid.UUID `db:"id"`
+	RevokedAt time.Time `db:"revoked_at"`
 }
 
 // PlusUserSessionGrant is a row of the plus_user_session_grant table: an OAuth 2.0 authorization request made in a user

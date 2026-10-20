@@ -9,14 +9,25 @@ import (
 	"time"
 )
 
-// Poll runs one poll of the background work.
+// Poll runs one refresh, then one processing, of the background work.
 func (m *Manager) Poll(ctx context.Context) {
-	m.poll(ctx)
+	m.refreshPoll(ctx)
+	m.process(ctx, m.clock.Now().UTC())
 }
 
 // Purge runs the purge of the background work.
 func (m *Manager) Purge(ctx context.Context) {
 	m.purge(ctx)
+}
+
+// Backoff is the wait before retrying a revocation after attempts failed attempts.
+func Backoff(attempts int) time.Duration {
+	return backoff(attempts)
+}
+
+// SetPollInterval sets how often Run polls.
+func (m *Manager) SetPollInterval(interval time.Duration) {
+	m.interval = interval
 }
 
 // QueuedWrites is how many activity writes are waiting.
@@ -30,8 +41,12 @@ func (m *Manager) Retention() time.Duration {
 }
 
 const (
-	ClaimLease    = claimLease
-	ProcessDelay  = processDelay
-	TouchInterval = touchInterval
-	WriteQueue    = writeQueue
+	ClaimLease     = claimLease
+	PurgeInterval  = purgeInterval
+	RefreshOverlap = refreshOverlap
+	ProcessTimeout = processTimeout
+	RetryBase      = retryBase
+	ProcessDelay   = processDelay
+	TouchInterval  = touchInterval
+	WriteQueue     = writeQueue
 )

@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     revoked_at DATETIME NULL DEFAULT NULL,
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
     claimed_at DATETIME NULL DEFAULT NULL,
-    processed_at DATETIME NULL DEFAULT NULL
+    processed_at DATETIME NULL DEFAULT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at DATETIME NULL DEFAULT NULL
 );`
 
 	queryPlusUserSessionGrantCreateSQLite = `
@@ -68,7 +70,9 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     revoked_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL,
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
     claimed_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL,
-    processed_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL
+    processed_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NULL
 );`
 
 	queryPlusUserSessionGrantCreatePostgreSQL = `
@@ -100,6 +104,8 @@ CREATE TABLE IF NOT EXISTS plus_user_session (
     revoked_by VARCHAR(100) NOT NULL DEFAULT '',
     claimed_at TIMESTAMP NULL DEFAULT NULL,
     processed_at TIMESTAMP NULL DEFAULT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at TIMESTAMP NULL DEFAULT NULL,
     INDEX plus_user_session_username (username),
     INDEX plus_user_session_revoked_at (revoked_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_520_ci;`
@@ -118,11 +124,11 @@ CREATE TABLE IF NOT EXISTS plus_user_session_grant (
 	queryPlusUserSessionCreateIndexUsername  = `CREATE INDEX IF NOT EXISTS plus_user_session_username ON plus_user_session (username);`
 	queryPlusUserSessionCreateIndexRevokedAt = `CREATE INDEX IF NOT EXISTS plus_user_session_revoked_at ON plus_user_session (revoked_at);`
 
-	queryPlusUserSessionColumns = `id, username, created_at, last_active, expires_at, ip, user_agent, grants, revoked_at, revoked_by, claimed_at, processed_at`
+	queryPlusUserSessionColumns = `id, username, created_at, last_active, expires_at, ip, user_agent, grants, revoked_at, revoked_by, claimed_at, processed_at, attempts, retry_at`
 
 	queryPlusUserSessionInsert = `
-INSERT INTO plus_user_session (id, username, created_at, last_active, expires_at, ip, user_agent)
-VALUES (?, ?, ?, ?, ?, ?, ?);`
+INSERT INTO plus_user_session (id, username, created_at, last_active, expires_at, ip, user_agent, grants)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);`
 
 	queryPlusUserSessionSelectByID = `SELECT ` + queryPlusUserSessionColumns + ` FROM plus_user_session WHERE id = ?;`
 
@@ -139,10 +145,13 @@ WHERE id = ? AND revoked_at IS NULL;`
 
 	// queryPlusUserSessionLockForGrant always changes the row when it matches, so every dialect reports it affected,
 	// and it holds the row lock until the grant is inserted: a revoke either waits for the grant or the insert fails.
+	// A record holding the most grants takes no more.
 	queryPlusUserSessionLockForGrant = `
 UPDATE plus_user_session
 SET grants = grants + 1
-WHERE id = ? AND revoked_at IS NULL AND processed_at IS NULL;`
+WHERE id = ? AND revoked_at IS NULL AND processed_at IS NULL AND grants < ?;`
+
+	queryPlusUserSessionSelectGrants = `SELECT grants FROM plus_user_session WHERE id = ?;`
 
 	queryPlusUserSessionGrantInsert = `
 INSERT INTO plus_user_session_grant (session_id, request_id, client_id, subject, sid, issuer)
@@ -160,6 +169,16 @@ ORDER BY request_id;`
 UPDATE plus_user_session
 SET revoked_at = ?, revoked_by = ?
 WHERE id = ? AND username = ? AND revoked_at IS NULL;`
+
+	queryPlusUserSessionRevokeOthers = `
+UPDATE plus_user_session
+SET revoked_at = ?, revoked_by = ?
+WHERE username = ? AND id <> ? AND revoked_at IS NULL;`
+
+	queryPlusUserSessionSelectRevokedOthers = `
+SELECT id
+FROM plus_user_session
+WHERE username = ? AND id <> ? AND revoked_at IS NOT NULL AND processed_at IS NULL;`
 
 	queryPlusUserSessionRevokeByUsername = `
 UPDATE plus_user_session
@@ -185,25 +204,26 @@ SELECT COUNT(id)
 FROM plus_user_session
 WHERE id = ? AND username = ? AND processed_at IS NULL;`
 
-	queryPlusUserSessionSelectRevokedIDs = `SELECT id FROM plus_user_session WHERE revoked_at IS NOT NULL AND revoked_at > ?;`
+	queryPlusUserSessionSelectRevokedIDs = `SELECT id, revoked_at FROM plus_user_session WHERE revoked_at IS NOT NULL AND revoked_at > ?;`
 
 	queryPlusUserSessionSelectUnprocessedIDs = `
 SELECT id
 FROM plus_user_session
 WHERE revoked_at IS NOT NULL AND revoked_at <= ? AND processed_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?)
-ORDER BY revoked_at
+    AND (retry_at IS NULL OR retry_at <= ?)
+ORDER BY attempts, revoked_at
 LIMIT ?;`
 
 	// queryPlusUserSessionClaim leases a revoked record to one instance. A lease older than the cutoff is taken over,
 	// so a record whose instance died or shut down mid-processing is processed anyway.
 	queryPlusUserSessionClaim = `
 UPDATE plus_user_session
-SET claimed_at = ?
+SET claimed_at = ?, attempts = attempts + 1
 WHERE id = ? AND revoked_at IS NOT NULL AND processed_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?);`
 
 	queryPlusUserSessionComplete = `UPDATE plus_user_session SET processed_at = ?, claimed_at = NULL WHERE id = ? AND processed_at IS NULL;`
 
-	queryPlusUserSessionUnclaim = `UPDATE plus_user_session SET claimed_at = NULL WHERE id = ? AND processed_at IS NULL;`
+	queryPlusUserSessionUnclaim = `UPDATE plus_user_session SET claimed_at = NULL, retry_at = ? WHERE id = ? AND processed_at IS NULL;`
 
 	// queryPlusUserSessionPurge never deletes a revoked record before it is processed: its grants' tokens can outlive
 	// the retention.
@@ -242,7 +262,7 @@ func (p *SQLProvider) PlusUserSessionsSchemaEnsure(ctx context.Context) (err err
 // SavePlusUserSession inserts a user session record.
 func (p *SQLProvider) SavePlusUserSession(ctx context.Context, s model.PlusUserSession) (err error) {
 	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionInsert),
-		s.ID, s.Username, s.CreatedAt, s.LastActive, s.ExpiresAt, s.IP, s.UserAgent); err != nil {
+		s.ID, s.Username, s.CreatedAt, s.LastActive, s.ExpiresAt, s.IP, s.UserAgent, 0); err != nil {
 		return fmt.Errorf("error inserting user session record for user '%s': %w", s.Username, err)
 	}
 
@@ -283,12 +303,13 @@ func (p *SQLProvider) UpdatePlusUserSessionActivity(ctx context.Context, id uuid
 }
 
 // SavePlusUserSessionGrant adds a grant to a user session record. It reports false when the record is missing or
-// revoked, as the grant could then be missed by the revocation; the caller must not issue it.
+// revoked, as the grant could then be missed by the revocation, or holds model.PlusUserSessionMaxGrants grants; the
+// caller must not issue it.
 func (p *SQLProvider) SavePlusUserSessionGrant(ctx context.Context, grant model.PlusUserSessionGrant) (ok bool, err error) {
 	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
 		var result sql.Result
 
-		if result, err = tx.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionLockForGrant), grant.SessionID); err != nil {
+		if result, err = tx.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionLockForGrant), grant.SessionID, model.PlusUserSessionMaxGrants); err != nil {
 			return err
 		}
 
@@ -332,8 +353,15 @@ func (p *SQLProvider) ReplacePlusUserSession(ctx context.Context, previous uuid.
 			return err
 		}
 
+		// The grants move with their count, so the replacement can't take more than its share.
+		var grants int
+
+		if err = tx.GetContext(ctx, &grants, p.db.Rebind(queryPlusUserSessionSelectGrants), previous); err != nil {
+			return err
+		}
+
 		if _, err = tx.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionInsert),
-			s.ID, s.Username, s.CreatedAt, s.LastActive, s.ExpiresAt, s.IP, s.UserAgent); err != nil {
+			s.ID, s.Username, s.CreatedAt, s.LastActive, s.ExpiresAt, s.IP, s.UserAgent, grants); err != nil {
 			return err
 		}
 
@@ -358,6 +386,30 @@ func (p *SQLProvider) RevokePlusUserSession(ctx context.Context, id uuid.UUID, u
 	}
 
 	return plusRowsAffected(result)
+}
+
+// RevokeOtherPlusUserSessions revokes every unrevoked user session record of username except the one with the ID
+// except, in a single statement, and returns how many it revoked and the IDs of that user's other records which are
+// revoked and not yet processed: the ones it revoked, and possibly some revoked just before.
+func (p *SQLProvider) RevokeOtherPlusUserSessions(ctx context.Context, username string, except uuid.UUID, revokedBy string, now time.Time) (count int64, ids []uuid.UUID, err error) {
+	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
+		var result sql.Result
+
+		if result, err = tx.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionRevokeOthers), now, revokedBy, username, except); err != nil {
+			return err
+		}
+
+		if count, err = result.RowsAffected(); err != nil {
+			return err
+		}
+
+		return tx.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectRevokedOthers), username, except)
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("error revoking the other user session records of user '%s': %w", username, err)
+	}
+
+	return count, ids, nil
 }
 
 // RevokePlusUserSessionsByUsername revokes every unrevoked user session record of a user, matching the username
@@ -409,27 +461,27 @@ func (p *SQLProvider) EndPlusUserSession(ctx context.Context, id uuid.UUID, user
 	return ok, nil
 }
 
-// LoadPlusUserSessionRevokedIDs loads the IDs of the user session records revoked after since.
-func (p *SQLProvider) LoadPlusUserSessionRevokedIDs(ctx context.Context, since time.Time) (ids []uuid.UUID, err error) {
-	if err = p.db.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectRevokedIDs), since); err != nil {
+// LoadPlusUserSessionRevocations loads the IDs and revocation times of the user session records revoked after since.
+func (p *SQLProvider) LoadPlusUserSessionRevocations(ctx context.Context, since time.Time) (revocations []model.PlusUserSessionRevocation, err error) {
+	if err = p.db.SelectContext(ctx, &revocations, p.db.Rebind(queryPlusUserSessionSelectRevokedIDs), since); err != nil {
 		return nil, fmt.Errorf("error selecting revoked user session records: %w", err)
 	}
 
-	return ids, nil
+	return revocations, nil
 }
 
 // LoadPlusUserSessionUnprocessedIDs loads up to limit IDs of the user session records revoked no later than before
-// whose revocation has not been processed, and which are unclaimed or were claimed before leaseBefore, oldest
-// revocation first.
-func (p *SQLProvider) LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before, leaseBefore time.Time, limit int) (ids []uuid.UUID, err error) {
-	if err = p.db.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectUnprocessedIDs), before, leaseBefore, limit); err != nil {
+// whose revocation has not been processed, which are unclaimed or were claimed before leaseBefore, and which are due
+// for a retry by now. The least attempted come first, then the oldest revocation, so failing records go last.
+func (p *SQLProvider) LoadPlusUserSessionUnprocessedIDs(ctx context.Context, before, leaseBefore, now time.Time, limit int) (ids []uuid.UUID, err error) {
+	if err = p.db.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectUnprocessedIDs), before, leaseBefore, now, limit); err != nil {
 		return nil, fmt.Errorf("error selecting unprocessed user session records: %w", err)
 	}
 
 	return ids, nil
 }
 
-// ClaimPlusUserSession leases the revocation of a user session record for processing. It reports false when it's
+// ClaimPlusUserSession leases the revocation of a user session record for processing, counting an attempt. It reports false when it's
 // processed, or another instance holds a lease taken at or after leaseBefore, in which case the caller must not
 // process it.
 func (p *SQLProvider) ClaimPlusUserSession(ctx context.Context, id uuid.UUID, now, leaseBefore time.Time) (ok bool, err error) {
@@ -451,9 +503,9 @@ func (p *SQLProvider) CompletePlusUserSession(ctx context.Context, id uuid.UUID,
 	return nil
 }
 
-// UnclaimPlusUserSession releases the lease on the revocation of a user session record, so it's retried.
-func (p *SQLProvider) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID) (err error) {
-	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionUnclaim), id); err != nil {
+// UnclaimPlusUserSession releases the lease on the revocation of a user session record, so it's retried from retryAt.
+func (p *SQLProvider) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID, retryAt time.Time) (err error) {
+	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionUnclaim), retryAt, id); err != nil {
 		return fmt.Errorf("error unclaiming user session record '%s': %w", id, err)
 	}
 

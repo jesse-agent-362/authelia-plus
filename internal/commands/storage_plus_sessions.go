@@ -5,7 +5,10 @@
 package commands
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -36,7 +39,8 @@ func newStorageUserPlusSessionsRevokeCmd(ctx *CmdCtx) (cmd *cobra.Command) {
 		Long: `Revoke every session of a user.
 
 This subcommand logs a user out everywhere: every running instance rejects their sessions within a few seconds, and
-revokes the OpenID Connect 1.0 grants of those sessions shortly after. The username is matched case insensitively.`,
+revokes the OpenID Connect 1.0 grants of those sessions shortly after. The username is matched exactly, case and all,
+so it must be the username the user logs in as.`,
 		Example: `authelia storage user sessions revoke john
 authelia storage user sessions revoke john --config config.yml`,
 		RunE: ctx.StorageUserPlusSessionsRevokeRunE,
@@ -65,12 +69,20 @@ func (ctx *CmdCtx) StorageUserPlusSessionsRevokeRunE(cmd *cobra.Command, args []
 		return fmt.Errorf("the storage provider does not support user sessions")
 	}
 
-	count, err := plussessions.RevokeUser(ctx, store, args[0], ctx.GetClock().Now())
+	return runStorageUserPlusSessionsRevoke(ctx, cmd.OutOrStdout(), cmd.ErrOrStderr(), store, args[0], ctx.GetClock().Now())
+}
+
+func runStorageUserPlusSessionsRevoke(ctx context.Context, w, errW io.Writer, store plussessions.Store, username string, now time.Time) (err error) {
+	count, err := plussessions.RevokeUser(ctx, store, username, now)
 	if err != nil {
-		return fmt.Errorf("failed to revoke the sessions of user '%s': %w", args[0], err)
+		return fmt.Errorf("failed to revoke the sessions of user '%s': %w", username, err)
 	}
 
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Successfully revoked %d sessions of user '%s'\n", count, args[0])
+	_, _ = fmt.Fprintf(w, "Successfully revoked %d sessions of user '%s'\n", count, username)
+
+	if count == 0 {
+		_, _ = fmt.Fprintf(errW, "Warning: no sessions of user '%s' were revoked. The username is matched exactly, so check its case and spelling against the username the user logs in as\n", username)
+	}
 
 	return nil
 }

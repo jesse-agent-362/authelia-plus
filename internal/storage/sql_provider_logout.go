@@ -7,9 +7,20 @@ package storage
 import (
 	"context"
 	"fmt"
+	"slices"
+
+	"github.com/rpadovani/sqlx-v2"
 )
 
 // authelia-plus: revoking the OAuth 2.0 sessions of a logged out user session.
+
+// revokeRequestIDsBatch bounds the request IDs revoked per statement, well below every dialect's limit on parameters.
+const revokeRequestIDsBatch = 100
+
+const queryFmtRevokeOAuth2SessionsByRequestIDs = `
+UPDATE %s
+SET revoked = TRUE
+WHERE request_id IN (?) AND revoked = FALSE;`
 
 // RevokeOAuth2SessionsByRequestIDs marks every access token, refresh token, authorization code, device code and OpenID
 // Connect 1.0 session belonging to the given authorization requests as revoked, in a single transaction. The request
@@ -34,13 +45,22 @@ func (p *SQLProvider) RevokeOAuth2SessionsByRequestIDs(ctx context.Context, requ
 		tableOAuth2OpenIDConnectSession,
 		tableOAuth2DeviceCodeSession,
 	} {
-		query := p.db.Rebind(fmt.Sprintf(queryFmtRevokeOAuth2SessionByRequestID, table))
+		for chunk := range slices.Chunk(requestIDs, revokeRequestIDsBatch) {
+			var (
+				query string
+				args  []any
+			)
 
-		for _, requestID := range requestIDs {
-			if _, err = tx.ExecContext(ctx, query, requestID); err != nil {
+			if query, args, err = sqlx.In(fmt.Sprintf(queryFmtRevokeOAuth2SessionsByRequestIDs, table), chunk); err != nil {
 				_ = tx.Rollback()
 
-				return fmt.Errorf("error revoking oauth2 sessions in table '%s' with request id '%s': %w", table, requestID, err)
+				return fmt.Errorf("error building the query to revoke oauth2 sessions in table '%s': %w", table, err)
+			}
+
+			if _, err = tx.ExecContext(ctx, p.db.Rebind(query), args...); err != nil {
+				_ = tx.Rollback()
+
+				return fmt.Errorf("error revoking oauth2 sessions in table '%s': %w", table, err)
 			}
 		}
 	}

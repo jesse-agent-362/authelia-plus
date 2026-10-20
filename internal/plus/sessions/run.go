@@ -6,6 +6,7 @@ package sessions
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,35 +16,39 @@ import (
 const storeTimeout = 10 * time.Second
 
 // Run writes the queued activity and polls the store until ctx is done: it refreshes the revoked set, processes new
-// revocations and purges old records.
+// revocations and purges old records. The refresh runs apart from the rest, so slow processing can't delay it.
 func (m *Manager) Run(ctx context.Context) {
-	done := make(chan struct{})
+	var wg sync.WaitGroup
 
-	go func() {
-		defer close(done)
-
-		m.write(ctx)
-	}()
-
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
+	wg.Go(func() { m.write(ctx) })
+	wg.Go(func() { m.every(ctx, m.refreshPoll) })
 
 	var purged time.Time
 
-	for {
-		select {
-		case <-ctx.Done():
-			<-done
-			return
-		case <-ticker.C:
-		}
-
-		m.poll(ctx)
+	m.every(ctx, func(ctx context.Context) {
+		m.process(ctx, m.clock.Now().UTC())
 
 		if now := m.clock.Now(); now.Sub(purged) >= purgeInterval {
 			m.purge(ctx)
 
 			purged = now
+		}
+	})
+
+	wg.Wait()
+}
+
+// every runs fn each poll interval until ctx is done.
+func (m *Manager) every(ctx context.Context, fn func(ctx context.Context)) {
+	ticker := time.NewTicker(m.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fn(ctx)
 		}
 	}
 }
@@ -65,7 +70,8 @@ func (m *Manager) write(ctx context.Context) {
 	}
 }
 
-func (m *Manager) poll(ctx context.Context) {
+// refreshPoll refreshes the revoked set and forgets the activity writes older than touchInterval.
+func (m *Manager) refreshPoll(ctx context.Context) {
 	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
@@ -84,18 +90,16 @@ func (m *Manager) poll(ctx context.Context) {
 	}
 
 	m.muTouched.Unlock()
-
-	m.process(ctx, now)
 }
 
 // process performs the side effects of the revocations older than processDelay. Each record is claimed first, so with
-// several instances one processes it at a time; a failed one is released again to be retried on the next poll, and
+// several instances one processes it at a time; a failed one is released again to be retried after a backoff, and
 // one whose instance stopped mid-processing is taken over once its claim is older than claimLease.
 func (m *Manager) process(ctx context.Context, now time.Time) {
 	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
-	ids, err := m.store.LoadPlusUserSessionUnprocessedIDs(pctx, now.Add(-processDelay), now.Add(-claimLease), processBatch)
+	ids, err := m.store.LoadPlusUserSessionUnprocessedIDs(pctx, now.Add(-processDelay), now.Add(-claimLease), now, processBatch)
 	if err != nil {
 		m.log.WithError(err).Error("Error occurred loading the revoked user sessions to process")
 
@@ -124,7 +128,7 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	if err != nil || record == nil {
 		m.log.WithError(err).Errorf("Error occurred loading the revoked user session '%s', it will be retried", id)
 
-		m.unclaim(id)
+		m.unclaim(id, 1)
 
 		return
 	}
@@ -133,16 +137,22 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	if err != nil {
 		m.log.WithError(err).Errorf("Error occurred loading the grants of the revoked user session '%s', it will be retried", id)
 
-		m.unclaim(id)
+		m.unclaim(id, record.Attempts)
 
 		return
 	}
 
 	if m.processor != nil {
-		if err = m.processor(ctx, record, grants); err != nil {
+		xctx, xcancel := context.WithTimeout(ctx, processTimeout)
+
+		err = m.processor(xctx, record, grants)
+
+		xcancel()
+
+		if err != nil {
 			m.log.WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 grants of the revoked user session '%s', it will be retried", id)
 
-			m.unclaim(id)
+			m.unclaim(id, record.Attempts)
 
 			return
 		}
@@ -162,15 +172,26 @@ func (m *Manager) processOne(ctx context.Context, id uuid.UUID, now time.Time) {
 	m.log.Debugf("Processed the revocation of the user session '%s' of user '%s'", id, record.Username)
 }
 
-// unclaim releases a claim for the next poll to retry. It's detached from ctx, which is done at shutdown; should it
-// fail anyway, the claim lapses after claimLease.
-func (m *Manager) unclaim(id uuid.UUID) {
+// unclaim releases a claim to be retried after the backoff for the attempts made. It's detached from ctx, which is
+// done at shutdown; should it fail anyway, the claim lapses after claimLease.
+func (m *Manager) unclaim(id uuid.UUID, attempts int) {
 	uctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
-	if err := m.store.UnclaimPlusUserSession(uctx, id); err != nil {
+	if err := m.store.UnclaimPlusUserSession(uctx, id, m.clock.Now().UTC().Add(backoff(attempts))); err != nil {
 		m.log.WithError(err).Errorf("Error occurred releasing the revoked user session '%s' for a retry", id)
 	}
+}
+
+// backoff is the wait before retrying a revocation after attempts failed attempts.
+func backoff(attempts int) time.Duration {
+	wait := retryBase
+
+	for i := 1; i < attempts && wait < retryMax; i++ {
+		wait *= 2
+	}
+
+	return min(wait, retryMax)
 }
 
 // purge deletes the records nothing needs any more: revoked ones past the retention, and unrevoked ones past the

@@ -179,15 +179,21 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.False(t, ok, "a revoked record takes no grant")
 
-	ids, err := provider.LoadPlusUserSessionRevokedIDs(ctx, now.Add(-time.Minute))
+	revocations, err := provider.LoadPlusUserSessionRevocations(ctx, now.Add(-time.Minute))
 	require.NoError(t, err)
-	assert.Equal(t, []uuid.UUID{john.ID}, ids)
+	require.Len(t, revocations, 1)
+	assert.Equal(t, john.ID, revocations[0].ID)
+	assert.WithinDuration(t, now, revocations[0].RevokedAt, time.Second)
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now.Add(-time.Second), lease, 10)
+	revocations, err = provider.LoadPlusUserSessionRevocations(ctx, now.Add(time.Second))
+	require.NoError(t, err)
+	assert.Empty(t, revocations, "only revocations after since")
+
+	ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now.Add(-time.Second), lease, now, 10)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "too recent to process")
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, now, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{john.ID}, ids)
 
@@ -203,7 +209,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.False(t, ok, "a claim is held for the lease")
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, now, 10)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "a claimed record isn't offered while the lease holds")
 
@@ -211,7 +217,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	// the record is offered and claimed again.
 	later := now.Add(6 * time.Minute)
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later.Add(-5*time.Minute), 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later.Add(-5*time.Minute), later, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{john.ID}, ids)
 
@@ -235,12 +241,19 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.Equal(t, "self", record.RevokedBy)
 	assert.Equal(t, 2, record.Grants)
+	assert.Equal(t, 2, record.Attempts, "each claim counts an attempt")
 
-	require.NoError(t, provider.UnclaimPlusUserSession(ctx, john.ID))
+	retry := later.Add(time.Minute)
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 10)
+	require.NoError(t, provider.UnclaimPlusUserSession(ctx, john.ID, retry))
+
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later, later, 10)
 	require.NoError(t, err)
-	assert.Equal(t, []uuid.UUID{john.ID}, ids, "a released record is offered again at once")
+	assert.Empty(t, ids, "a released record waits for its retry")
+
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, retry, retry, retry, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []uuid.UUID{john.ID}, ids, "a released record is offered again once due")
 
 	ok, err = provider.ClaimPlusUserSession(ctx, john.ID, now, lease)
 	require.NoError(t, err)
@@ -248,7 +261,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 
 	require.NoError(t, provider.CompletePlusUserSession(ctx, john.ID, now))
 
-	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later, 10)
+	ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, later, later, later, 10)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "a processed record is never offered again")
 
@@ -301,7 +314,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 		assert.False(t, record.ClaimedAt.Valid)
 		assert.Equal(t, "logout", record.RevokedBy)
 
-		ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, 100)
+		ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, lease, now, 100)
 		require.NoError(t, err)
 		assert.Contains(t, ids, fresh.ID)
 
@@ -346,6 +359,10 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 		require.NoError(t, err)
 		require.Len(t, grants, 1, "the grants move to the replacement")
 		assert.Equal(t, "replace1", grants[0].RequestID)
+
+		record, err = provider.LoadPlusUserSession(ctx, next.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 1, record.Grants, "the grants' count moves with them")
 
 		// Requirement 4: a re-authentication racing a revoke of the record it replaces fails, and changes nothing.
 		ok, err = provider.RevokePlusUserSession(ctx, next.ID, "harry", "self", now)
@@ -397,6 +414,124 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	require.NotNil(t, record)
 	assert.False(t, record.ProcessedAt.Valid)
+}
+
+func TestSQLProviderPlusUserSessionsRevokeOthers(t *testing.T) {
+	for name, provider := range newTestPlusProviders(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
+
+			now := time.Unix(1760000000, 0).UTC()
+
+			current, live, hidden, harry := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "harry", now)
+
+			// Expired by its expires_at, which a lagging activity write may have left behind a live session.
+			hidden.ExpiresAt = now.Add(-time.Hour)
+
+			for _, s := range []model.PlusUserSession{current, live, hidden, harry} {
+				require.NoError(t, provider.SavePlusUserSession(ctx, s))
+			}
+
+			ok, err := provider.RevokePlusUserSession(ctx, live.ID, "john", "self", now)
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			// live is revoked but unprocessed; hidden is unrevoked.
+			count, ids, err := provider.RevokeOtherPlusUserSessions(ctx, "john", current.ID, "self", now)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), count, "only hidden was unrevoked")
+			assert.ElementsMatch(t, []uuid.UUID{live.ID, hidden.ID}, ids, "every other revoked and unprocessed record of the user")
+
+			for _, id := range []uuid.UUID{current.ID, harry.ID} {
+				record, err := provider.LoadPlusUserSession(ctx, id)
+				require.NoError(t, err)
+				assert.False(t, record.RevokedAt.Valid)
+			}
+
+			record, err := provider.LoadPlusUserSession(ctx, hidden.ID)
+			require.NoError(t, err)
+			assert.True(t, record.RevokedAt.Valid, "an expired-looking session is revoked too")
+
+			count, ids, err = provider.RevokeOtherPlusUserSessions(ctx, "JOHN", uuid.Nil, "self", now)
+			require.NoError(t, err)
+			assert.Zero(t, count, "the username is matched exactly")
+			assert.Empty(t, ids)
+		})
+	}
+}
+
+func TestSQLProviderPlusUserSessionsRetryOrder(t *testing.T) {
+	for name, provider := range newTestPlusProviders(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
+
+			now := time.Unix(1760000000, 0).UTC()
+
+			failing, fresh := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now)
+
+			for _, s := range []model.PlusUserSession{failing, fresh} {
+				require.NoError(t, provider.SavePlusUserSession(ctx, s))
+			}
+
+			// failing was revoked first, so it'd come first on age alone.
+			ok, err := provider.RevokePlusUserSession(ctx, failing.ID, "john", "self", now.Add(-time.Minute))
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			ok, err = provider.RevokePlusUserSession(ctx, fresh.ID, "john", "self", now)
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			ok, err = provider.ClaimPlusUserSession(ctx, failing.ID, now, now)
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			require.NoError(t, provider.UnclaimPlusUserSession(ctx, failing.ID, now))
+
+			ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, now, now, 10)
+			require.NoError(t, err)
+			assert.Equal(t, []uuid.UUID{fresh.ID, failing.ID}, ids, "a record that failed goes after one never attempted")
+		})
+	}
+}
+
+func TestSQLProviderPlusUserSessionsGrantCap(t *testing.T) {
+	for name, provider := range newTestPlusProviders(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
+
+			now := time.Unix(1760000000, 0).UTC()
+
+			record := newTestPlusUserSession(t, "john", now)
+
+			require.NoError(t, provider.SavePlusUserSession(ctx, record))
+
+			// Filled directly: a thousand transactions would make this the slowest test by far.
+			_, err := provider.db.ExecContext(ctx, provider.db.Rebind(`UPDATE plus_user_session SET grants = ? WHERE id = ?;`), model.PlusUserSessionMaxGrants-1, record.ID)
+			require.NoError(t, err)
+
+			ok, err := provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: record.ID, RequestID: "last"})
+			require.NoError(t, err)
+			assert.True(t, ok)
+
+			ok, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: record.ID, RequestID: "one-too-many"})
+			require.NoError(t, err)
+			assert.False(t, ok, "a full record takes no more grants")
+
+			next := newTestPlusUserSession(t, "john", now)
+
+			ok, err = provider.ReplacePlusUserSession(ctx, record.ID, next, "replaced")
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			ok, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: next.ID, RequestID: "after-replace"})
+			require.NoError(t, err)
+			assert.False(t, ok, "a re-authentication doesn't reset the count")
+		})
+	}
 }
 
 // TestSQLProviderPlusUserSessionGrantsConcurrent checks that grants recorded concurrently in one session, while the

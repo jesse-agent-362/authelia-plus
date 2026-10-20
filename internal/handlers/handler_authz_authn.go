@@ -124,6 +124,9 @@ func (s *CookieSessionAuthnStrategy) Get(ctx AuthzContext, manager session.Manag
 	}
 
 	if modified, invalid := handleAuthnCookieValidate(ctx, manager, &userSession, s.refresh); invalid {
+		// authelia-plus: the session ends as on a logout, so its record is closed and its grants revoked.
+		authzLogout(ctx, &userSession)
+
 		if err = manager.DestroySession(); err != nil {
 			ctx.GetLogger().WithError(err).Errorf("Unable to destroy user session")
 		}

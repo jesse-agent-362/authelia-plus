@@ -38,6 +38,7 @@ const (
 const (
 	ClaimJWTID                               = "jti"
 	ClaimSessionID                           = "sid"
+	ClaimEvents                              = "events"
 	ClaimAccessTokenHash                     = "at_hash"
 	ClaimCodeHash                            = "c_hash"
 	ClaimStateHash                           = "s_hash"

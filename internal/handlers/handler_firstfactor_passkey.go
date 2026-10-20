@@ -334,7 +334,7 @@ func FirstFactorPasskeyPOST(ctx *middlewares.AutheliaCtx) {
 		"verified": response.Response.AuthenticatorData.Flags.HasUserVerified(),
 	}).Debug("Passkey Login")
 
-	if err = plusSessionsCreate(ctx, provider.Config, &userSession, details.Username, keepMeLoggedIn); err != nil {
+	if err = plusSessionsCreate(ctx, provider.Config, &userSession, userSession.PlusID, userSession.Username, details.Username, keepMeLoggedIn); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		ctx.SetJSONError(messageMFAValidationFailed)
 

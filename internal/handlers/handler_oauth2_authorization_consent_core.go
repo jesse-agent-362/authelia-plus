@@ -89,6 +89,9 @@ func handleOAuth2AuthorizationConsentSessionUpdates(ctx *middlewares.AutheliaCtx
 	var err error
 
 	if modified, invalid := handleSessionValidateRefresh(ctx, userSession, ctx.Configuration.AuthenticationBackend.RefreshInterval); invalid {
+		// authelia-plus: the session ends as on a logout, so its record is closed and its grants revoked.
+		oauth2Logout(ctx, userSession)
+
 		if err = ctx.DestroySession(); err != nil {
 			ctx.GetLogger().WithError(err).Errorf("Authorization Request with id '%s' on client with id '%s' using policy '%s' for user '%s' had an error while destroying session", requester.GetID(), client.GetID(), policy.Name, userSession.Username)
 		}

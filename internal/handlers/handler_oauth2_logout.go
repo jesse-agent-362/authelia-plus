@@ -65,7 +65,7 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 
 			loggedIn = true
 		case !oauth2EndSessionHintMatches(ctx, requester, &userSession):
-			ctx.GetLogger().Warnf("End Session Request from client with id '%s' has an 'id_token_hint' for a different user than '%s': the session was not ended", clientID, userSession.Username)
+			ctx.GetLogger().Warnf("End Session Request from client with id '%s' has an 'id_token_hint' which was not issued to user '%s' in this session: the session was not ended", clientID, userSession.Username)
 
 			loggedIn = true
 		default:
@@ -97,9 +97,29 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 	http.Redirect(rw, r, target.String(), http.StatusFound) //nolint:gosec // Matched exactly against the client's registered post logout redirect URIs.
 }
 
-// oauth2EndSessionHintMatches returns true when the subject of the request's validated 'id_token_hint' belongs to the
-// logged in user.
+// oauth2EndSessionHintMatches returns true when the request's validated 'id_token_hint' was issued to the logged in
+// user during this session: its subject belongs to the user, it was issued no earlier than the session's first factor,
+// and its 'sid', if any, is the session's. A hint from an earlier session, which any client holding an old ID Token
+// could replay, never ends a newer one. A Logout Token, which carries an 'events' claim, is never accepted as a hint.
 func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthelia2.RPInitiatedLogoutRequester, userSession *session.UserSession) bool {
+	claims := requester.GetIDTokenHintClaims()
+	if claims == nil {
+		return false
+	}
+
+	if _, ok := claims[oidc.ClaimEvents]; ok {
+		return false
+	}
+
+	iat, err := claims.GetIssuedAt()
+	if err != nil || iat == nil || iat.Unix() < userSession.FirstFactorAuthnTimestamp {
+		return false
+	}
+
+	if sid := requester.GetSessionID(); sid != "" && (userSession.OpenIDConnect == nil || sid != userSession.OpenIDConnect.SessionID) {
+		return false
+	}
+
 	subject, err := uuid.Parse(requester.GetSubject())
 	if err != nil {
 		return false

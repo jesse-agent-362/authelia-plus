@@ -44,6 +44,11 @@ type PlusSessionResponse struct {
 	Current bool `json:"current"`
 }
 
+// PlusSessionsRevokedResponse is how many sessions a request revoked.
+type PlusSessionsRevokedResponse struct {
+	Count int64 `json:"count"`
+}
+
 // PlusSessionsGET lists the active sessions of the logged in user.
 func PlusSessionsGET(ctx *middlewares.AutheliaCtx) {
 	userSession, ok := plusSessionsUserSession(ctx)
@@ -119,6 +124,31 @@ func PlusSessionDELETE(ctx *middlewares.AutheliaCtx) {
 	ctx.ReplyOK()
 }
 
+// PlusSessionsDELETE revokes every session of the logged in user but the current one, including live sessions the list
+// hides because a lagging activity write left them looking expired, and responds with how many it revoked.
+func PlusSessionsDELETE(ctx *middlewares.AutheliaCtx) {
+	userSession, ok := plusSessionsUserSession(ctx)
+	if !ok {
+		return
+	}
+
+	count, err := ctx.Providers.PlusSessions.RevokeOthers(ctx, userSession.Username, userSession.PlusID)
+	if err != nil {
+		ctx.Logger.WithError(err).Errorf("Error occurred revoking the other sessions of user '%s'", userSession.Username)
+
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.SetJSONError(messageOperationFailed)
+
+		return
+	}
+
+	ctx.Logger.WithFields(map[string]any{"username": userSession.Username, "count": count}).Info("User revoked their other sessions")
+
+	if err = ctx.SetJSONBody(PlusSessionsRevokedResponse{Count: count}); err != nil {
+		ctx.Logger.WithError(err).Errorf("Error occurred encoding the revoked sessions count of user '%s'", userSession.Username)
+	}
+}
+
 func plusSessionsUserSession(ctx *middlewares.AutheliaCtx) (userSession session.UserSession, ok bool) {
 	var err error
 
@@ -142,20 +172,28 @@ func plusSessionsUserSession(ctx *middlewares.AutheliaCtx) (userSession session.
 // plusSessionsCreate records the session of an authentication which is about to succeed, and sets the record's ID on
 // it. It must run before the session is marked authenticated, and the authentication must fail if it returns an error:
 // a session without a record could never be revoked. A re-authentication replaces the session's previous record.
-func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCookie, userSession *session.UserSession, username string, keepMeLoggedIn bool) (err error) {
+func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCookie, userSession *session.UserSession, previous uuid.UUID, previousUsername, username string, keepMeLoggedIn bool) (err error) {
 	if ctx.Providers.PlusSessions == nil {
 		return errPlusSessionsUnavailable
 	}
 
 	var id uuid.UUID
 
-	if id, err = ctx.Providers.PlusSessions.Create(ctx, username, ctx.RemoteIP().String(), string(ctx.UserAgent()), keepMeLoggedIn, config, userSession.PlusID, userSession.Username); err != nil {
+	if id, err = ctx.Providers.PlusSessions.Create(ctx, username, ctx.RemoteIP().String(), string(ctx.UserAgent()), keepMeLoggedIn, config, previous, previousUsername); err != nil {
 		return err
 	}
 
 	userSession.PlusID = id
 
 	return nil
+}
+
+// authzLogout ends a session the authorization found invalid, for a deleted or disabled user or inactivity, as a logout
+// does: its record is closed and its grants revoked. The session is about to be destroyed.
+func authzLogout(ctx AuthzContext, userSession *session.UserSession) {
+	if actx, ok := ctx.(*middlewares.AutheliaCtx); ok {
+		oauth2Logout(actx, userSession)
+	}
 }
 
 // plusSessionsRecordGrant adds an authorization request made in the session to the session's record, so revoking the
@@ -224,12 +262,30 @@ func plusSessionsRevokeGrants(ctx context.Context, provider *oidc.OpenIDConnectP
 	return err
 }
 
+// plusSessionsGrantsWithoutClients returns the grants with their Back-Channel Logout clients removed.
+func plusSessionsGrantsWithoutClients(grants []model.PlusUserSessionGrant) (stripped []model.PlusUserSessionGrant) {
+	stripped = make([]model.PlusUserSessionGrant, 0, len(grants))
+
+	for _, grant := range grants {
+		if grant.RequestID != "" {
+			stripped = append(stripped, model.PlusUserSessionGrant{SessionID: grant.SessionID, RequestID: grant.RequestID})
+		}
+	}
+
+	return stripped
+}
+
 // NewPlusSessionsProcessor returns the side effects of a revoked session: its OpenID Connect 1.0 grants are revoked
-// and its Back-Channel Logout clients are sent a Logout Token, as on logout.
+// and its Back-Channel Logout clients are sent a Logout Token, as on logout. A record ended by logout had its Logout
+// Tokens sent by the logout itself, so only its grants are revoked again.
 func NewPlusSessionsProcessor(providers *middlewares.Providers, config *schema.Configuration, logger *logrus.Entry) plussessions.Processor {
 	return func(ctx context.Context, record *model.PlusUserSession, grants []model.PlusUserSessionGrant) (err error) {
 		if providers.OpenIDConnect == nil {
 			return nil
+		}
+
+		if record.RevokedBy == plussessions.RevokedByLogout {
+			grants = plusSessionsGrantsWithoutClients(grants)
 		}
 
 		return plusSessionsRevokeGrants(ctx, providers.OpenIDConnect, providers.StorageProvider, logger, func(issuer string) (oidc.Context, context.CancelFunc, error) {

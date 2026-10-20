@@ -8,8 +8,11 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/middlewares"
+	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
 	"github.com/authelia/authelia/v4/internal/regulation"
 	"github.com/authelia/authelia/v4/internal/session"
 )
@@ -100,6 +103,10 @@ func FirstFactorPasswordPOST(delayer middlewares.Delayer) middlewares.RequestHan
 			return
 		}
 
+		// The session being replaced, read before it's destroyed so its record is closed rather than left open. A
+		// revoked one reads as anonymous, so there's nothing to close.
+		previous, _ := provider.GetSession(ctx.RequestCtx)
+
 		if err = provider.DestroySession(ctx.RequestCtx); err != nil {
 			// This failure is not likely to be critical as we ensure to regenerate the session below.
 			ctx.Logger.WithError(err).Trace("Failed to destroy session during 1FA attempt")
@@ -139,7 +146,15 @@ func FirstFactorPasswordPOST(delayer middlewares.Delayer) middlewares.RequestHan
 
 		ctx.Logger.Tracef(logFmtTraceProfileDetails, details.Username, details.Groups, details.Emails)
 
-		if err = plusSessionsCreate(ctx, provider.Config, &userSession, details.Username, keepMeLoggedIn); err != nil {
+		err = plusSessionsCreate(ctx, provider.Config, &userSession, previous.PlusID, previous.Username, details.Username, keepMeLoggedIn)
+
+		if errors.Is(err, plussessions.ErrRecordUnavailable) {
+			// The previous record was revoked meanwhile, and its revocation is processed as usual. This is a full login,
+			// so it gets a fresh record rather than failing.
+			err = plusSessionsCreate(ctx, provider.Config, &userSession, uuid.Nil, "", details.Username, keepMeLoggedIn)
+		}
+
+		if err != nil {
 			ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "session record", regulation.AuthType1FA, logFmtActionAuthentication, details.Username)
 
 			respondUnauthorized(ctx, messageAuthenticationFailed)
@@ -278,7 +293,7 @@ func FirstFactorReauthenticatePOST(delayer middlewares.Delayer) middlewares.Requ
 
 		ctx.Logger.Tracef(logFmtTraceProfileDetails, userSession.Username, userDetails.Groups, userDetails.Emails)
 
-		if err = plusSessionsCreate(ctx, ctx.GetSessionConfig(), &userSession, userSession.Username, userSession.KeepMeLoggedIn); err != nil {
+		if err = plusSessionsCreate(ctx, ctx.GetSessionConfig(), &userSession, userSession.PlusID, userSession.Username, userSession.Username, userSession.KeepMeLoggedIn); err != nil {
 			ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "session record", regulation.AuthType1FA, logFmtActionAuthentication, userSession.Username)
 
 			respondUnauthorized(ctx, messageAuthenticationFailed)

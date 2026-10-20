@@ -77,6 +77,65 @@ func TestPlusSessionsFirstFactorPassword(t *testing.T) {
 		assert.NotEqual(t, uuid.Nil, second.PlusID)
 		assert.NotEqual(t, first.PlusID, second.PlusID)
 		assert.NotNil(t, mock.PlusSessionsStore.Get(second.PlusID))
+
+		old := mock.PlusSessionsStore.Get(first.PlusID)
+
+		require.NotNil(t, old)
+		assert.True(t, old.RevokedAt.Valid, "logging in again closes the record of the session it replaces")
+		assert.Equal(t, plussessions.RevokedByReplace, old.RevokedBy)
+	})
+
+	t.Run("ShouldRevokeRecordOfAnotherUserOnLogin", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtx(t)
+		defer mock.Close()
+
+		expectTestPlusPasswordSuccess(mock)
+
+		first := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+
+		// The same browser, logged in as someone else.
+		mock.PlusSessionsStore.Records[first.PlusID].Username = "harry"
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		userSession.Username = "harry"
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		second := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.NotEqual(t, first.PlusID, second.PlusID)
+
+		old := mock.PlusSessionsStore.Get(first.PlusID)
+
+		assert.True(t, old.RevokedAt.Valid)
+		assert.False(t, old.ProcessedAt.Valid, "another user's session is revoked as on a logout, grants and all")
+		assert.Equal(t, plussessions.RevokedBySwitch, old.RevokedBy)
+	})
+
+	t.Run("ShouldLoginWhenPreviousRecordWasRevokedMeanwhile", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtx(t)
+		defer mock.Close()
+
+		expectTestPlusPasswordSuccess(mock)
+
+		first := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+
+		// Revoked in the store by another instance, which this one hasn't refreshed yet.
+		_, err := mock.PlusSessionsStore.RevokePlusUserSession(mock.Ctx, first.PlusID, testValue, plussessions.RevokedBySelf, mock.Clock.Now())
+		require.NoError(t, err)
+
+		second := doTestPlusPasswordLogin(t, mock)
+
+		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.NotEqual(t, uuid.Nil, second.PlusID)
+		assert.NotEqual(t, first.PlusID, second.PlusID)
+		assert.Equal(t, plussessions.RevokedBySelf, mock.PlusSessionsStore.Get(first.PlusID).RevokedBy)
 	})
 
 	t.Run("ShouldFailClosedWhenRecordFails", func(t *testing.T) {
@@ -193,7 +252,7 @@ func TestPlusSessionsOpenIDConnectAuthorization(t *testing.T) {
 
 		userSession := newTestOIDCUserSession(1)
 
-		require.NoError(t, plusSessionsCreate(mock.Ctx, mock.Ctx.Configuration.Session.Cookies[0], &userSession, testUsername, false))
+		require.NoError(t, plusSessionsCreate(mock.Ctx, mock.Ctx.Configuration.Session.Cookies[0], &userSession, userSession.PlusID, userSession.Username, testUsername, false))
 		require.NoError(t, mock.Ctx.SaveSession(userSession))
 
 		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, "https://app.example.com/backchannel-logout"))
@@ -436,7 +495,7 @@ func TestPlusSessionsLogout(t *testing.T) {
 
 		now := mock.Clock.Now().UTC().Add(time.Minute)
 
-		ids, err := mock.PlusSessionsStore.LoadPlusUserSessionUnprocessedIDs(mock.Ctx, now, now, 10)
+		ids, err := mock.PlusSessionsStore.LoadPlusUserSessionUnprocessedIDs(mock.Ctx, now, now, now, 10)
 
 		require.NoError(t, err)
 		require.Equal(t, []uuid.UUID{userSession.PlusID}, ids, "the revocation is left for the poller")
@@ -449,6 +508,42 @@ func TestPlusSessionsLogout(t *testing.T) {
 		processor := NewPlusSessionsProcessor(&mock.Ctx.Providers, &mock.Ctx.Configuration, mock.Ctx.Logger)
 
 		require.NoError(t, processor(mock.Ctx, record, grants))
+	})
+
+	t.Run("ShouldNotSendLogoutTokenTwiceForLogout", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		ok, err := mock.PlusSessionsStore.SavePlusUserSessionGrant(mock.Ctx, model.PlusUserSessionGrant{SessionID: userSession.PlusID, RequestID: "request-id", ClientID: testOIDCAuthorizationCodeID, Subject: "subject", SID: "sid", Issuer: "https://login.example.com:8080"})
+
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"request-id"}).Return(nil).Times(2)
+
+		oauth2Logout(mock.Ctx, &userSession)
+
+		require.Len(t, receiver.Tokens(), 1)
+
+		record := mock.PlusSessionsStore.Get(userSession.PlusID)
+		require.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
+
+		grants, err := mock.PlusSessionsStore.LoadPlusUserSessionGrants(mock.Ctx, userSession.PlusID)
+		require.NoError(t, err)
+
+		processor := NewPlusSessionsProcessor(&mock.Ctx.Providers, &mock.Ctx.Configuration, mock.Ctx.Logger)
+
+		require.NoError(t, processor(mock.Ctx, record, grants))
+		assert.Len(t, receiver.Tokens(), 1, "the poller revokes the grants again but sends no second Logout Token")
 	})
 
 	t.Run("ShouldNotRevokeGrantsOfProcessedRecord", func(t *testing.T) {
@@ -465,5 +560,65 @@ func TestPlusSessionsLogout(t *testing.T) {
 
 		// No storage expectation is set, so any revocation fails the test.
 		oauth2Logout(mock.Ctx, &userSession)
+	})
+}
+
+func TestPlusSessionsEndedWhenRefreshInvalidates(t *testing.T) {
+	t.Run("ShouldEndRecordOnAuthz", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+		require.NotEqual(t, uuid.Nil, userSession.PlusID)
+
+		authz := NewAuthzBuilder().WithImplementationForwardAuth().WithStrategies(NewCookieSessionAuthnStrategy(schema.NewRefreshIntervalDurationAlways())).Build()
+
+		target, err := url.ParseRequestURI("https://one-factor.example.com")
+		require.NoError(t, err)
+
+		setRequestForwardAuth(mock.Ctx, fasthttp.MethodGet, target, true, false)
+
+		mock.UserProviderMock.EXPECT().GetDetails(userSession.Username).Return(nil, authentication.ErrUserNotFound)
+
+		authz.Handler(mock.Ctx)
+
+		record := mock.PlusSessionsStore.Get(userSession.PlusID)
+
+		assert.True(t, record.RevokedAt.Valid, "the record of a session destroyed for a deleted user is closed")
+		assert.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
+	})
+
+	t.Run("ShouldEndRecordOnConsent", func(t *testing.T) {
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		mock.Ctx.Configuration.AuthenticationBackend.RefreshInterval = schema.NewRefreshIntervalDurationAlways()
+
+		client := newTestOIDCAuthorizationCodeClient(t)
+		client.ConsentMode = "implicit"
+
+		config := newTestOIDCConfig(t)
+		config.Clients = []schema.IdentityProvidersOpenIDConnectClient{client}
+
+		// As setupTestOIDCAuthorizationCodeFlow, but the user is gone from the backend.
+		setupTestOIDCProvider(t, mock, config)
+		setupTestOIDCSessionStore(t, mock)
+		setupTestOIDCConsentStore(t, mock)
+		setupTestOIDCSubjectStore(t, mock)
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		mock.UserProviderMock.EXPECT().GetDetails(userSession.Username).Return(nil, authentication.ErrUserNotFound)
+
+		rw, r := newTestOAuth2Request(t, fasthttp.MethodGet, testOIDCAuthorizationEndpoint, newTestOIDCAuthorizationValues())
+
+		OAuth2AuthorizationGET(mock.Ctx, rw, r)
+
+		record := mock.PlusSessionsStore.Get(userSession.PlusID)
+
+		assert.True(t, record.RevokedAt.Valid, "the record of a session destroyed for a deleted user is closed")
+		assert.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
 	})
 }

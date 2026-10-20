@@ -297,6 +297,7 @@ func handlerMain(config *schema.Configuration, providers middlewares.Providers) 
 		Build()
 
 	r.GET("/api/plus/sessions", middlewareFullAuth(handlers.PlusSessionsGET))
+	r.DELETE("/api/plus/sessions", middlewareFullAuth(handlers.PlusSessionsDELETE))
 	r.DELETE("/api/plus/sessions/{sessionID}", middlewareFullAuth(handlers.PlusSessionDELETE))
 	r.POST("/api/user/session/elevation", middlewareElevatePOST(handlers.UserSessionElevationPOST))
 	r.PUT("/api/user/session/elevation", middlewareElevatePUT(handlers.UserSessionElevationPUT))

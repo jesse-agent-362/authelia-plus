@@ -23,7 +23,7 @@ import (
 )
 
 // ErrRecordUnavailable is returned when a user session record can no longer take a grant or be replaced, because it is
-// missing, revoked or its revocation is being processed.
+// missing, revoked or its revocation is being processed, or it holds model.PlusUserSessionMaxGrants grants.
 var ErrRecordUnavailable = errors.New("the user session record is missing or revoked")
 
 // New returns a Manager for the user session records in store.
@@ -34,6 +34,7 @@ func New(config *schema.Configuration, store Store, clock clock.Provider) *Manag
 		log:       logging.Logger().WithField("provider", "plus sessions"),
 		memory:    config.Session.Redis == nil,
 		retention: retention(config.Session) + retentionMargin,
+		interval:  pollInterval,
 		revoked:   map[uuid.UUID]time.Time{},
 		touched:   map[uuid.UUID]time.Time{},
 		writes:    make(chan activity, writeQueue),
@@ -48,9 +49,14 @@ type Manager struct {
 	memory    bool
 	retention time.Duration
 	processor Processor
+	interval  time.Duration
 
 	mu      sync.RWMutex
 	revoked map[uuid.UUID]time.Time
+
+	// latest is the latest revocation time seen by a refresh, and reloaded when the whole retention was last loaded.
+	latest   time.Time
+	reloaded time.Time
 
 	muTouched sync.Mutex
 	touched   map[uuid.UUID]time.Time
@@ -190,6 +196,24 @@ func (m *Manager) Revoke(ctx context.Context, id uuid.UUID, username string) (ok
 	return m.revoke(ctx, id, username, RevokedBySelf)
 }
 
+// RevokeOthers revokes every session record of username but the one with the ID current, and returns how many it
+// revoked. The sessions are rejected by this instance immediately.
+func (m *Manager) RevokeOthers(ctx context.Context, username string, current uuid.UUID) (count int64, err error) {
+	now := m.clock.Now().UTC()
+
+	var ids []uuid.UUID
+
+	if count, ids, err = m.store.RevokeOtherPlusUserSessions(ctx, username, current, RevokedBySelf, now); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		m.markRevoked(id, now)
+	}
+
+	return count, nil
+}
+
 // RecordGrant adds an OAuth 2.0 authorization request to the record of the session it was made in, so revoking the
 // session can revoke its tokens. It returns ErrRecordUnavailable when the record is revoked or missing, in
 // which case the caller must not issue the grant.
@@ -259,29 +283,48 @@ func RevokeUser(ctx context.Context, store Store, username string, now time.Time
 	return store.RevokePlusUserSessionsByUsername(ctx, username, RevokedByCLI, now.UTC())
 }
 
-// refresh adds the IDs revoked within the retention to the revoked set, and forgets the IDs seen longer ago than
+// refresh adds the IDs revoked since the latest revocation it saw, less refreshOverlap, to the revoked set. Every
+// purgeInterval it loads the IDs revoked within the whole retention instead, and forgets the IDs seen longer ago than
 // that. On error the set is left as it was.
 func (m *Manager) refresh(ctx context.Context) (err error) {
 	now := m.clock.Now().UTC()
 
-	var ids []uuid.UUID
+	m.mu.RLock()
+	latest, full := m.latest, now.Sub(m.reloaded) >= purgeInterval
+	m.mu.RUnlock()
 
-	if ids, err = m.store.LoadPlusUserSessionRevokedIDs(ctx, now.Add(-m.retention)); err != nil {
+	since := latest.Add(-refreshOverlap)
+
+	if full || latest.IsZero() {
+		since = now.Add(-m.retention)
+	}
+
+	var revocations []model.PlusUserSessionRevocation
+
+	if revocations, err = m.store.LoadPlusUserSessionRevocations(ctx, since); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, id := range ids {
-		if _, ok := m.revoked[id]; !ok {
-			m.revoked[id] = now
+	for _, r := range revocations {
+		if _, ok := m.revoked[r.ID]; !ok {
+			m.revoked[r.ID] = now
+		}
+
+		if r.RevokedAt.After(m.latest) {
+			m.latest = r.RevokedAt
 		}
 	}
 
-	for id, seen := range m.revoked {
-		if now.Sub(seen) > m.retention {
-			delete(m.revoked, id)
+	if full {
+		m.reloaded = now
+
+		for id, seen := range m.revoked {
+			if now.Sub(seen) > m.retention {
+				delete(m.revoked, id)
+			}
 		}
 	}
 
