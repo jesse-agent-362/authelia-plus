@@ -281,8 +281,14 @@ func oauth2Logout(ctx *middlewares.AutheliaCtx, userSession *session.UserSession
 		return
 	}
 
-	if err := plusSessionsRevokeGrants(ctx, ctx.Providers.OpenIDConnect, ctx.Providers.StorageProvider, ctx.GetLogger(), func(_ string) (oidc.Context, context.CancelFunc, error) {
-		return oidc.NewDetachedContext(ctx, backChannelLogoutTimeout)
+	// The grants from the record name the issuer their ID Tokens were issued by; the session's own copy doesn't, so its
+	// Logout Tokens are issued by this request's issuer.
+	if err := plusSessionsRevokeGrants(ctx, ctx.Providers.OpenIDConnect, ctx.Providers.StorageProvider, ctx.GetLogger(), func(issuer string) (oidc.Context, context.CancelFunc, error) {
+		if issuer == "" {
+			return oidc.NewDetachedContext(ctx, backChannelLogoutTimeout)
+		}
+
+		return plusSessionsIssuerContext(&ctx.Providers, &ctx.Configuration, issuer)
 	}, userSession.Username, grants); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of user '%s' during logout", userSession.Username)
 	}

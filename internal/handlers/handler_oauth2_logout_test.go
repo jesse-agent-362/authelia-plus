@@ -421,6 +421,37 @@ func TestOAuth2EndSession(t *testing.T) {
 		assertLoggedIn(t, mock, false)
 	})
 
+	// The Logout Token is issued by the issuer the grant's ID Tokens were, not whichever host the logout came from.
+	t.Run("ShouldSendLogoutTokenAsTheGrantsIssuer", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		const issuer = "https://other.example.com"
+
+		require.Len(t, mock.PlusSessionsStore.Grants, 1)
+		require.NotEqual(t, issuer, mock.PlusSessionsStore.Grants[0].Issuer)
+
+		mock.PlusSessionsStore.Grants[0].Issuer = issuer
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		code, _ := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{hint}})
+
+		assert.Equal(t, http.StatusFound, code)
+		require.Len(t, receiver.Tokens(), 1)
+
+		_, claims := mustDecodeTestJWT(t, receiver.Tokens()[0])
+		assert.Equal(t, issuer, claims[oidc.ClaimIssuer])
+	})
+
 	t.Run("ShouldLogoutWithMatchingIDTokenHintAndNotifyBackChannel", func(t *testing.T) {
 		setupTestOIDCBackChannelLogoutInline(t)
 

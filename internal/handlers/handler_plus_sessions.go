@@ -381,21 +381,27 @@ func NewPlusSessionsProcessor(providers *middlewares.Providers, config *schema.C
 		}
 
 		return plusSessionsRevokeGrants(ctx, providers.OpenIDConnect, providers.StorageProvider, logger, func(issuer string) (oidc.Context, context.CancelFunc, error) {
-			u, err := url.Parse(issuer)
-			if err != nil || issuer == "" {
-				return nil, nil, errors.New("the issuer is missing or invalid")
-			}
-
-			dctx, cancel := oidc.NewDetachedContextFromProviders(u, oidc.DetachedContextProviders{
-				Clock:    providers.Clock,
-				Random:   providers.Random,
-				Config:   config,
-				Storage:  providers.StorageProvider,
-				Users:    providers.UserProvider,
-				Resolver: providers.UserAttributeResolver,
-			}, backChannelLogoutTimeout)
-
-			return dctx, cancel, nil
+			return plusSessionsIssuerContext(providers, config, issuer)
 		}, record.Username, grants)
 	}
+}
+
+// plusSessionsIssuerContext returns a Context for delivering Logout Tokens as the issuer a grant's ID Tokens were
+// issued by, so the Logout Tokens carry the same 'iss' whichever host the logout or revocation came from.
+func plusSessionsIssuerContext(providers *middlewares.Providers, config *schema.Configuration, issuer string) (oidc.Context, context.CancelFunc, error) {
+	u, err := url.Parse(issuer)
+	if err != nil || issuer == "" {
+		return nil, nil, errors.New("the issuer is missing or invalid")
+	}
+
+	dctx, cancel := oidc.NewDetachedContextFromProviders(u, oidc.DetachedContextProviders{
+		Clock:    providers.Clock,
+		Random:   providers.Random,
+		Config:   config,
+		Storage:  providers.StorageProvider,
+		Users:    providers.UserProvider,
+		Resolver: providers.UserAttributeResolver,
+	}, backChannelLogoutTimeout)
+
+	return dctx, cancel, nil
 }
