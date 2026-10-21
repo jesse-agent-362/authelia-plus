@@ -24,11 +24,11 @@ For everything Authelia itself does, see the [Authelia documentation](https://ww
 
 ## Install
 
-Images for `linux/amd64` and `linux/arm64` are published to GHCR. Pin a release by digest; each
+Images for `linux/amd64` and `linux/arm64` are published to GHCR. Pin a release by digest. The image tag has no `v`, unlike the git tag; each
 [release](https://github.com/man15h/authelia-plus/releases) lists its tag and digest:
 
 ```yaml
-image: ghcr.io/man15h/authelia-plus:v4.39.28-plus.1@sha256:<digest>
+image: ghcr.io/man15h/authelia-plus:4.39.28-plus.1@sha256:<digest>
 ```
 
 A release is a drop-in replacement for the upstream release it is built on. The configuration is the same, plus the
