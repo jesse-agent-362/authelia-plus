@@ -6,9 +6,11 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,11 +39,23 @@ import (
 // logged out, so the Relying Party never shows a logout that did not happen. Every other case goes to the portal,
 // including invalid requests.
 //
+// A cross-site POST arrives without the session cookie, as browsers drop SameSite=Lax cookies on cross-site POSTs, and
+// would look like a logged out user. An anonymous POST is therefore bounced once to the same request as a GET, which
+// carries the cookie, marked so that a still anonymous user is sent to the portal rather than the Relying Party.
+//
 // https://openid.net/specs/openid-connect-rpinitiated-1_0.html
 func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
 	requester, err := ctx.Providers.OpenIDConnect.NewRPInitiatedLogoutRequest(ctx, r)
 	if err != nil {
 		ctx.GetLogger().Errorf("End Session Request could not be processed: %s", oauthelia2.ErrorToDebugRFC6749Error(err))
+
+		oauth2EndSessionRedirectPortal(ctx, rw, r)
+
+		return
+	}
+
+	if hint := requester.GetIDTokenHint(); hint != "" && !oauth2EndSessionHintTypeValid(hint) {
+		ctx.GetLogger().Errorf("End Session Request could not be processed: the 'id_token_hint' is not an ID Token")
 
 		oauth2EndSessionRedirectPortal(ctx, rw, r)
 
@@ -60,7 +74,18 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 		ctx.GetLogger().WithError(err).Errorf("End Session Request from client with id '%s' could not load the user session", clientID)
 
 		loggedIn = true
-	} else if !userSession.IsAnonymous() {
+	} else if userSession.IsAnonymous() {
+		switch {
+		case r.Method == http.MethodPost:
+			oauth2EndSessionBounce(ctx, rw, r)
+
+			return
+		case r.URL.Query().Has(oauth2EndSessionBounced):
+			ctx.GetLogger().Infof("End Session Request from client with id '%s' has no session after the bounce: the user is not known to be logged out", clientID)
+
+			loggedIn = true
+		}
+	} else {
 		switch {
 		case requester.GetIDTokenHint() == "":
 			ctx.GetLogger().Infof("End Session Request from client with id '%s' has no 'id_token_hint': the session of user '%s' was not ended", clientID, userSession.Username)
@@ -156,6 +181,53 @@ func oauth2ClaimUnix(claims jwt.MapClaims, claim string) (unix int64, ok bool) {
 	}
 }
 
+// oauth2EndSessionHintTypeValid returns true when the 'id_token_hint' has the 'typ' header of an ID Token, or none.
+// Access Tokens and Logout Tokens are signed with the same keys, issuer and audience as ID Tokens and would otherwise
+// validate as a hint.
+func oauth2EndSessionHintTypeValid(hint string) bool {
+	segment, _, _ := strings.Cut(hint, ".")
+
+	raw, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		return false
+	}
+
+	var header struct {
+		Type *string `json:"typ"`
+	}
+
+	if err = json.Unmarshal(raw, &header); err != nil {
+		return false
+	}
+
+	return header.Type == nil || strings.EqualFold(*header.Type, oauth2EndSessionHintType)
+}
+
+// oauth2EndSessionBounce sends a POST back to the end session endpoint as a GET with the same parameters.
+func oauth2EndSessionBounce(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
+	issuer, err := ctx.IssuerURL()
+	if err != nil {
+		ctx.GetLogger().WithError(err).Error("End Session Request could not determine the end session endpoint to redirect to")
+
+		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		return
+	}
+
+	query := url.Values{}
+
+	for key, values := range r.Form {
+		query[key] = values
+	}
+
+	query.Set(oauth2EndSessionBounced, "1")
+
+	target := issuer.JoinPath(oidc.EndpointPathEndSession)
+	target.RawQuery = query.Encode()
+
+	http.Redirect(rw, r, target.String(), http.StatusSeeOther)
+}
+
 func oauth2EndSessionRedirectPortal(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
 	portal, err := ctx.IssuerURL()
 	if err != nil {
@@ -236,7 +308,15 @@ func handleOAuth2AuthorizationLogoutState(ctx *middlewares.AutheliaCtx, provider
 
 // backChannelLogoutTimeout bounds how long Logout Token delivery may take in total. The library retries unreachable
 // clients, and nothing else would stop a hung one.
-const backChannelLogoutTimeout = 30 * time.Second
+const (
+	backChannelLogoutTimeout = 30 * time.Second
+
+	// oauth2EndSessionBounced marks an End Session Request that was bounced from a POST to a GET.
+	oauth2EndSessionBounced = "authelia_plus_bounced"
+
+	// oauth2EndSessionHintType is the only 'typ' header accepted on an 'id_token_hint', besides none.
+	oauth2EndSessionHintType = "JWT"
+)
 
 // goBackChannelLogout runs Logout Token delivery off the request goroutine. Replaced in tests.
 var goBackChannelLogout = func(deliver func()) { go deliver() }

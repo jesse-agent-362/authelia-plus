@@ -21,6 +21,8 @@ import (
 	"github.com/valyala/fasthttp"
 	"go.uber.org/mock/gomock"
 
+	"authelia.com/provider/oauth2/token/jwt"
+
 	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/mocks"
@@ -750,6 +752,137 @@ func TestOAuth2EndSession(t *testing.T) {
 				assertLoggedIn(t, mock, true)
 			})
 		}
+	})
+
+	t.Run("ShouldBounceAnonymousPOSTToGET", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		require.NoError(t, mock.Ctx.DestroySession())
+
+		code, location := endSession(t, mock, fasthttp.MethodPost, url.Values{
+			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			oidc.FormParameterState:                    []string{"abc123"},
+		})
+
+		assert.Equal(t, http.StatusSeeOther, code)
+
+		target, err := url.Parse(location)
+
+		require.NoError(t, err)
+		assert.Equal(t, testOIDCEndSessionEndpoint, (&url.URL{Scheme: target.Scheme, Host: target.Host, Path: target.Path}).String())
+		assert.Equal(t, url.Values{
+			oidc.FormParameterClientID:                 []string{testOIDCAuthorizationCodeID},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			oidc.FormParameterState:                    []string{"abc123"},
+			"authelia_plus_bounced":                    []string{"1"},
+		}, target.Query())
+
+		code, location = endSession(t, mock, fasthttp.MethodGet, target.Query())
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+	})
+
+	t.Run("ShouldLogoutAfterBounce", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			testOIDCFormParameterIDTokenHint:           []string{hint},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+			"authelia_plus_bounced":                    []string{"1"},
+		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
+		assertLoggedIn(t, mock, false)
+	})
+
+	t.Run("ShouldNotLogoutWithIDTokenHintOfAnotherType", func(t *testing.T) {
+		testCases := []struct {
+			typ      string
+			expected bool
+		}{
+			{"JWT", false},
+			{"jwt", false},
+			{"at+jwt", true},
+			{"logout+jwt", true},
+			{"application/at+jwt", true},
+			{"other", true},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.typ, func(t *testing.T) {
+				mock := setup(t)
+				defer mock.Close()
+
+				_, claims := mustDecodeTestJWT(t, mustGetTestOIDCIDToken(t, mock))
+
+				hint, _, err := mock.Ctx.Providers.OpenIDConnect.GetJWTStrategy(mock.Ctx).Encode(mock.Ctx, jwt.MapClaims(claims), jwt.WithHeaders(&jwt.Headers{Extra: map[string]any{"typ": tc.typ}}))
+
+				require.NoError(t, err)
+
+				header, _ := mustDecodeTestJWT(t, hint)
+
+				require.Equal(t, tc.typ, header["typ"])
+
+				if !tc.expected {
+					expectTestOIDCRevokeSession(t, mock).Return(nil)
+				}
+
+				code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+					testOIDCFormParameterIDTokenHint:           []string{hint},
+					testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+				})
+
+				assert.Equal(t, http.StatusFound, code)
+				assertLoggedIn(t, mock, tc.expected)
+
+				if tc.expected {
+					assert.Equal(t, testOIDCPortalURL, location)
+				} else {
+					assert.Equal(t, testOIDCPostLogoutRedirectURI, location)
+				}
+			})
+		}
+	})
+
+	t.Run("ShouldNotLogoutWithLogoutTokenAsIDTokenHint", func(t *testing.T) {
+		setupTestOIDCBackChannelLogoutInline(t)
+
+		receiver := newTestBackChannelLogoutReceiver(t)
+
+		mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+		defer mock.Close()
+
+		setupTestOIDCAuthorizationCodeFlow(t, mock, newTestOIDCBackChannelLogoutClient(t, receiver.URL))
+
+		mustGetTestOIDCIDToken(t, mock)
+
+		expectTestOIDCRevokeSession(t, mock).Return(nil)
+
+		userSession, err := mock.Ctx.GetSession()
+
+		require.NoError(t, err)
+
+		oauth2Logout(mock.Ctx, &userSession)
+
+		tokens := receiver.Tokens()
+
+		require.Len(t, tokens, 1)
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{testOIDCFormParameterIDTokenHint: []string{tokens[0]}})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assert.Len(t, receiver.Tokens(), 1)
+		assertLoggedIn(t, mock, true)
 	})
 
 	t.Run("ShouldRedirectAnonymousUser", func(t *testing.T) {
