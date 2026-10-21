@@ -1,4 +1,5 @@
 <!--
+SPDX-FileCopyrightText: 2026 Authelia
 SPDX-FileCopyrightText: 2026 authelia-plus contributors
 
 SPDX-License-Identifier: Apache-2.0
