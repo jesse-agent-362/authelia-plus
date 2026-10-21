@@ -1,129 +1,103 @@
 <!--
-SPDX-FileCopyrightText: 2026 Authelia
+SPDX-FileCopyrightText: 2026 authelia-plus contributors
 
 SPDX-License-Identifier: Apache-2.0
 -->
 
 # Security Policy
 
-## Prologue
+__authelia-plus__ is a fork of [Authelia] that adds OpenID Connect logout, user session management and a few smaller
+features on top of an upstream release. This policy covers the code the fork adds. Everything else is Authelia's code
+and goes to Authelia under [their security policy][upstream policy].
 
-The __Authelia__ team takes security very seriously. Because __Authelia__ is intended as a security product a lot of
-decisions are made with security being the priority and we always aim to implement security by design.
+## Reporting a vulnerability
 
-## Policy
+Report privately through GitHub: [report a vulnerability]. Please don't open an issue, discuss it in public, or tell
+third parties until the fix is released.
 
-1. Reports that include a severity rating must use the CVSSv4 rating system.
-2. Reporters that use Generative Artificial Intelligence in any part of discovery of a vulnerability, providing
-   information about a vulnerability, providing a proof-of-concept for a vulnerability, or providing a suggested fix
-   to a vulnerability must abide by the [Artificial Intelligence Policy]. This includes abiding by the conversational
-   area of the repository rule which effectively only allows using it to generate code, and full disclosure of the use
-   of Generative Artificial Intelligence. Please read the full [Artificial Intelligence Policy] for more information.
-3. Reporters that are aware of specific requirements to trigger a vulnerability such as configurations or architectures
-   should include this information in their report.
-4. The report and interactions in the report are subject to the [Code of Conduct].
+A report should include:
 
-**_Translation:**_ You may use artificial intelligence to perform translation but it must be strictly follow the
-policy around translations which is located in the [Translation Section of the Artificial Intelligence Policy].
+1. The authelia-plus version or commit, and the configuration needed to trigger the issue.
+2. Steps to reproduce, and a working proof of concept against your own instance.
+3. The impact in practice: what an attacker gains, and what they need beforehand.
+4. A CVSS 4.0 vector, if you have one. We set the final rating.
 
-## Coordinated vulnerability disclosure
+If you used generative AI anywhere in finding, describing, reproducing or fixing the issue, say how. A person must
+have checked the report and run the proof of concept. Reports that weren't checked this way are closed without a
+reward.
 
-__Authelia__ follows the [coordinated vulnerability disclosure] model when dealing with security vulnerabilities. This
-was previously known as responsible disclosure. We strongly urge anyone reporting vulnerabilities to __Authelia__ or any
-other project to follow this model as it is considered as a best practice by many in the security industry.
+## In scope
 
-If you believe you have identified a security vulnerability or security related bug with __Authelia__ please make every
-effort to contact us privately using one of the [contact options](#contact-options) below. Please do not open an issue,
-do not notify us in public, and do not disclose this issue to third parties.
+The code authelia-plus adds or changes on top of the upstream release it's built on. For a release
+`v<upstream>-plus.<n>`, that is the diff between upstream's `v<upstream>` tag and our tag. Today that means:
 
-Using this process helps ensure that users affected have an avenue to fixing the issue as close to the issue being
-made public as possible. This mitigates the increasing the attack surface (via improving attacker knowledge) for
-diligent administrators simply via the act of disclosing the security issue.
+- OpenID Connect RP-initiated logout (`end_session_endpoint`) and back-channel logout.
+- User sessions: the `/api/plus/sessions` API, the Sessions page in the settings, the
+  `authelia storage user sessions` commands, and how sessions and their grants are recorded and revoked.
+- The operator stylesheet, `custom.css` served from `server.asset_path`.
+- Our build and release workflows and the images they publish.
 
-## Contact Options
+A bug in upstream Authelia code that our changes don't touch is out of scope here. Please report it to
+[Authelia][upstream policy] instead.
 
-Several contact options exist however it's important you specifically use a security contact method when reporting a
-security vulnerability or security related bug. These methods are clearly documented below.
+## Bug bounty
 
-### GitHub Security
+Valid, in-scope reports are rewarded by severity:
 
-Users can utilize GitHub's security vulnerability system to privately [report a vulnerability]. This is an easy method
-for users who have a GitHub account.
+| Severity | CVSS 4.0 | Reward | Examples |
+|:--------:|:--------:|:------:|:---------|
+| Critical | 9.0–10.0 | 1,000 USDC | Account takeover, or a bypass of authentication or the second factor |
+| High | 7.0–8.9 | 300 USDC | A revoked or logged out session that keeps access; revoking another user's session |
+| Medium | 4.0–6.9 | 100 USDC | Reading another user's sessions; a forced logout with real impact |
+| Low | 0.1–3.9 | Credit only | |
 
-### Email
+The bounty has a total budget of **2,000 USDC**. Once it's spent, rewards pause and this page says so. Reports are still
+welcome while it's paused, and are credited.
 
-Users can utilize the [security@authelia.com](mailto:security@authelia.com) email address to privately report a
-vulnerability. This is an easy method of users who do not have a GitHub account.
+Rules:
 
-This email address is only accessible by members of the [core team] for the purpose of disclosing security
-vulnerabilities and issues within the __Authelia__ code base.
+- The first valid report of an issue is rewarded. Duplicates and issues we already know of are not.
+- One reward per root cause, at the severity of its worst impact.
+- Rewards are paid once the fix is released.
+- The rating and the reward are decided by the maintainer. A rating can move with the impact shown in practice.
+- Test only on instances you own. Don't test against anyone else's deployment, including ours.
+- We may change or end the bounty at any time. A report is handled under the terms in place when it was submitted.
 
-### Chat
+Out of scope for rewards:
 
-If you wish to chat directly instead of sending an email please use one of the
-[chat options] to direct / private message one of the [core team] members.
+- Denial of service and rate limiting.
+- Output from automated scanners without a working exploit.
+- Issues that need a misconfiguration the documentation advises against, or administrator access.
+- Social engineering, phishing, and physical access.
+- Missing headers or best practices with no demonstrated impact.
+- Vulnerabilities in dependencies or in upstream Authelia code, which go to those projects.
 
-Please avoid this method unless absolutely necessary. We generally prefer that users use either the
-[GitHub Security](#github-security) or [Email](#email) option rather than this option as it both allows multiple team
-members to deal with the report and prevents mistakes when contacting a [core team] member.
+### Payment
 
-The [core team] members are identified in [Matrix] as room admins, and in [Discord] with the `Core Team` role.
+authelia-plus has no company behind it. Rewards are paid by the maintainer personally, in USDC only:
+
+- To an address you give privately in the advisory, on Ethereum or Base, your choice.
+- The address is confirmed first with a small test transfer, as a payment sent on the wrong network is lost.
+- We pay the network fee.
+- Taxes on a reward are yours.
+- We can't pay where the law prohibits it, for example under sanctions, and we don't pay to sanctioned addresses.
+
+## Safe harbour
+
+If you research in good faith and follow this policy, we won't take legal action against you or report you to the
+authorities, and we consider the research authorised. Good faith means you test only your own instances, don't access,
+change or keep other people's data, don't degrade anyone's service, and give us reasonable time to fix the issue before
+you disclose it.
 
 ## Process
 
-1. The user privately reports a potential vulnerability.
-2. The report is acknowledged as received.
-3. The report is reviewed to ascertain if additional information is required. If it is required:
-	1. The user is informed that the additional information is required.
-	2. The user privately adds the additional information.
-	3. The process begins at step 3 again, proceeding to step 4 if the additional information provided is sufficient.
-4. The vulnerability is reproduced.
-5. The vulnerability is patched, and if possible the user reporting the bug is given access to a fixed binary, docker
-   image, and git patch.
-6. The patch is confirmed to resolve the vulnerability.
-7. The CVE identifier is requested and assigned.
-8. The following steps are completed at the same time:
-	- The [security advisory] is published as an initial public disclosure which includes the impact and brief details of
-	  the vulnerability, mitigation instructions, severity, and a brief summary. This disclosure is also published by
-	  [MITRE] and [NIST] etc. This initial public disclosure may
-	  not include all information:
-		1. That was disclosed during the private disclosure process.
-		2. That is necessary to reproduce the vulnerability.
-	- The patch is swiftly merged into the codebase and a release is cut. The commit includes a clear reference to the
-	  CVE identifier.
-9. The [security advisory] is updated with any additional information that was otherwise not disclosed in the
-   initial public disclosure roughly 7 days after the release.
+1. We aim to acknowledge a report within 5 days and to confirm or reject it within 14 days.
+2. We reproduce the issue, rate it, and agree the details with you.
+3. We fix it and release the fix. Where possible you get to try it first.
+4. We publish a [security advisory], with a CVE when one is warranted, and credit you unless you prefer otherwise.
+5. A reward, if any, is paid.
 
-## Credit
-
-Users who report bugs will at their discretion (i.e. they do not have to be if they wish to remain anonymous) be
-credited for the discovery. Both in the [security advisory] and in our
-[all contributors] documentation.
-
-## Help wanted
-
-We are actively looking for sponsorship to obtain security audits to comprehensively ensure the security of _Authelia_.
-As security is really important to us we see this as one of the main financial priorities.
-
-We believe that we should obtain the following categories of security audits:
-
-* Code Security Audit / Analysis
-* Penetration Testing
-
-If you know of a company which either performs these kinds of audits and would be willing to sponsor the audit in some
-way such as doing it pro bono or at a discounted rate, or wants to help improve _Authelia_ in a meaningful way and is
-willing to make a financial contribution towards this then please feel free to contact us.
-
-[MITRE]: https://www.mitre.org/
-[NIST]: https://www.nist.gov/
-[coordinated vulnerability disclosure]: https://en.wikipedia.org/wiki/Coordinated_vulnerability_disclosure
-[security advisory]: https://github.com/authelia/authelia/security/advisories
-[report a vulnerability]: https://github.com/authelia/authelia/security/advisories/new
-[core team]: https://www.authelia.com/policies/governance/#core-team
-[all contributors]: https://github.com/authelia/authelia/blob/master/README.md#contribute
-[Artificial Intelligence Policy]: https://www.authelia.com/policies/artificial-intelligence/
-[Translation Section of the Artificial Intelligence Policy]: https://www.authelia.com/policies/artificial-intelligence/#translation
-[Code of Conduct]: https://www.authelia.com/policies/code-of-conduct/
-[Matrix]: https://www.authelia.com/information/contact/#matrix
-[Discord]: https://www.authelia.com/information/contact/#discord
-[chat options]: https://www.authelia.com/information/contact/#chat
+[Authelia]: https://github.com/authelia/authelia
+[upstream policy]: https://www.authelia.com/policies/security/
+[report a vulnerability]: https://github.com/man15h/authelia-plus/security/advisories/new
+[security advisory]: https://github.com/man15h/authelia-plus/security/advisories
