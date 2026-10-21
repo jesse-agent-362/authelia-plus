@@ -290,14 +290,21 @@ func handlerMain(config *schema.Configuration, providers middlewares.Providers) 
 
 	r.GET("/api/user/session/elevation", middleware1FA(handlers.UserSessionElevationGET))
 
-	// authelia-plus: the user's session list and revoke. No CORS policy and no GET form of the revoke.
+	// authelia-plus: the user's session list and revoke. No CORS policy and no GET form of the revoke. Revoking
+	// another session also needs an elevated session; the single revoke checks that itself, as revoking the current
+	// session doesn't.
 	middlewareFullAuth := middlewares.NewBridgeBuilder(*config, providers).
 		WithPreMiddlewares(middlewares.SecurityHeadersBase, middlewares.SecurityHeadersNoStore, middlewares.SecurityHeadersCSPNone).
 		WithPostMiddlewares(middlewares.RequireFullAuth).
 		Build()
 
+	middlewareFullAuthElevated := middlewares.NewBridgeBuilder(*config, providers).
+		WithPreMiddlewares(middlewares.SecurityHeadersBase, middlewares.SecurityHeadersNoStore, middlewares.SecurityHeadersCSPNone).
+		WithPostMiddlewares(middlewares.RequireFullAuth, middlewares.RequireElevated).
+		Build()
+
 	r.GET("/api/plus/sessions", middlewareFullAuth(handlers.PlusSessionsGET))
-	r.DELETE("/api/plus/sessions", middlewareFullAuth(handlers.PlusSessionsDELETE))
+	r.DELETE("/api/plus/sessions", middlewareFullAuthElevated(handlers.PlusSessionsDELETE))
 	r.DELETE("/api/plus/sessions/{sessionID}", middlewareFullAuth(handlers.PlusSessionDELETE))
 	r.POST("/api/user/session/elevation", middlewareElevatePOST(handlers.UserSessionElevationPOST))
 	r.PUT("/api/user/session/elevation", middlewareElevatePUT(handlers.UserSessionElevationPUT))

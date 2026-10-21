@@ -642,9 +642,16 @@ func TestShouldRevokeOtherSessions(t *testing.T) {
 	harry, err := m.Create(context.Background(), "harry", "192.0.2.1", "Mozilla/5.0", false, testCookie(), uuid.Nil, "")
 	require.NoError(t, err)
 
-	count, err := m.RevokeOthers(context.Background(), "john", current)
+	require.NoError(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: other, RequestID: "req1"}))
+
+	count, ids, err := m.RevokeOthers(context.Background(), "john", current)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), count)
+	assert.Equal(t, []uuid.UUID{other}, ids)
+
+	grants, err := m.Grants(context.Background(), ids...)
+	require.NoError(t, err)
+	assert.Equal(t, []model.PlusUserSessionGrant{{SessionID: other, RequestID: "req1"}}, grants)
 
 	assert.True(t, m.Revoked(other), "rejected here at once")
 	assert.False(t, m.Revoked(current))
@@ -826,6 +833,162 @@ func TestShouldWriteActivityInRun(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// A full reload that keeps failing, say because the retention grew too large to load in time, must not stop the set
+// from learning of new revocations: the incremental refresh runs instead, and the full reload waits to be retried.
+func TestShouldRefreshIncrementallyWhenFullReloadFails(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	require.NoError(t, m.StartupCheck())
+
+	first, second := testCreate(t, m), testCreate(t, m)
+
+	_, err := store.RevokePlusUserSession(context.Background(), first, "john", RevokedByCLI, c.Now())
+	require.NoError(t, err)
+
+	m.Poll(context.Background())
+	require.True(t, m.Revoked(first))
+
+	retention := m.Retention()
+
+	store.RevocationsError = func(since time.Time) error {
+		if since.Before(c.Now().Add(-retention / 2)) {
+			return errTest
+		}
+
+		return nil
+	}
+
+	c.Set(c.Now().Add(PurgeInterval))
+
+	_, err = store.RevokePlusUserSession(context.Background(), second, "john", RevokedByCLI, c.Now())
+	require.NoError(t, err)
+
+	calls := len(store.RevocationsSince)
+
+	m.Poll(context.Background())
+
+	assert.True(t, m.Revoked(second), "learned from the incremental refresh")
+	assert.Len(t, store.RevocationsSince, calls+2, "the failed full reload, then the incremental refresh")
+
+	calls = len(store.RevocationsSince)
+
+	m.Poll(context.Background())
+
+	assert.Len(t, store.RevocationsSince, calls+1, "the full reload isn't retried on every poll")
+
+	c.Set(c.Now().Add(ReloadRetry))
+
+	calls = len(store.RevocationsSince)
+
+	m.Poll(context.Background())
+
+	assert.Len(t, store.RevocationsSince, calls+2, "the full reload is retried after ReloadRetry")
+}
+
+// A session whose record is gone, after a database restore or a purge, is rejected once its activity finds no record,
+// rather than accepted forever with nothing to revoke.
+func TestShouldRejectSessionWhoseRecordIsMissing(t *testing.T) {
+	m, store, c := newTestManager(t, true)
+
+	kept, lost := testCreate(t, m), testCreate(t, m)
+
+	delete(store.Records, lost)
+
+	c.Set(c.Now().Add(TouchInterval))
+
+	for _, id := range []uuid.UUID{kept, lost} {
+		m.Touch(&session.UserSession{Username: "john", PlusID: id}, testCookie())
+	}
+
+	m.DrainWrites(context.Background())
+
+	assert.False(t, m.Revoked(kept))
+	assert.True(t, m.Revoked(lost))
+}
+
+// unchangedRowsStore reports no row affected by an activity write, as MySQL does when the values didn't change.
+type unchangedRowsStore struct {
+	*mocks.PlusSessionsStore
+}
+
+func (s unchangedRowsStore) UpdatePlusUserSessionActivity(_ context.Context, _ uuid.UUID, _, _ time.Time) (bool, error) {
+	return false, nil
+}
+
+func TestShouldNotRejectSessionWhoseActivityChangedNoRow(t *testing.T) {
+	store := mocks.NewPlusSessionsStore()
+	c := clock.NewFixed(time.Unix(1760000000, 0))
+	m := New(newTestConfig(true), unchangedRowsStore{store}, c)
+
+	id := testCreate(t, m)
+
+	c.Set(c.Now().Add(TouchInterval))
+
+	m.Touch(&session.UserSession{Username: "john", PlusID: id}, testCookie())
+	m.DrainWrites(context.Background())
+
+	assert.False(t, m.Revoked(id), "the record exists, so the session stands")
+}
+
+// A token request is refused once the session its authorization was made in is revoked, on any instance.
+func TestShouldReportRequestRevoked(t *testing.T) {
+	m, store, _ := newTestManager(t, true)
+
+	id := testCreate(t, m)
+
+	require.NoError(t, m.RecordGrant(context.Background(), model.PlusUserSessionGrant{SessionID: id, RequestID: "req1"}))
+
+	revoked, err := m.RequestRevoked(context.Background(), "req1")
+	require.NoError(t, err)
+	assert.False(t, revoked)
+
+	revoked, err = m.RequestRevoked(context.Background(), "unknown")
+	require.NoError(t, err)
+	assert.False(t, revoked, "a request no record holds, like client credentials")
+
+	// Revoked by another instance: this one's set doesn't hold it yet.
+	_, err = store.RevokePlusUserSession(context.Background(), id, "john", RevokedBySelf, time.Now())
+	require.NoError(t, err)
+
+	revoked, err = m.RequestRevoked(context.Background(), "req1")
+	require.NoError(t, err)
+	assert.True(t, revoked)
+
+	store.SetError("LoadPlusUserSessionByRequestID", errTest)
+
+	_, err = m.RequestRevoked(context.Background(), "req1")
+	assert.ErrorIs(t, err, errTest)
+}
+
+// Revocations by the user or an administrator are processed before logouts, whose tokens the logout already revoked.
+func TestShouldProcessUserRevocationsBeforeLogouts(t *testing.T) {
+	m, _, c := newTestManager(t, true)
+
+	loggedOut, revoked := testCreate(t, m), testCreate(t, m)
+
+	_, _, err := m.End(context.Background(), loggedOut, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(time.Second))
+
+	_, err = m.Revoke(context.Background(), revoked, "john")
+	require.NoError(t, err)
+
+	c.Set(c.Now().Add(ProcessDelay + time.Second))
+
+	var order []uuid.UUID
+
+	m.SetProcessor(func(_ context.Context, record *model.PlusUserSession, _ []model.PlusUserSessionGrant) error {
+		order = append(order, record.ID)
+
+		return nil
+	})
+
+	m.Poll(context.Background())
+
+	assert.Equal(t, []uuid.UUID{revoked, loggedOut}, order)
 }
 
 func TestShouldRefreshWhileProcessingIsStuck(t *testing.T) {

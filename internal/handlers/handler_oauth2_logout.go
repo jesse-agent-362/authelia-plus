@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	oauthelia2 "authelia.com/provider/oauth2"
+	"authelia.com/provider/oauth2/token/jwt"
 
 	"github.com/authelia/authelia/v4/internal/middlewares"
 	"github.com/authelia/authelia/v4/internal/model"
@@ -99,8 +101,9 @@ func OAuth2EndSession(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *h
 
 // oauth2EndSessionHintMatches returns true when the request's validated 'id_token_hint' was issued to the logged in
 // user during this session: its subject belongs to the user, and either its 'sid' is the session's, or it has no 'sid'
-// and was issued no earlier than the user logged in to the session. That login time is not moved by a
-// re-authentication, so an ID Token from before a 'prompt=login' still logs out. A hint from an earlier session, which
+// and its 'auth_time' is no earlier than the user logged in to the session. That login time is not moved by a
+// re-authentication, so an ID Token from before a 'prompt=login' still logs out. The 'iat' can't be used: a refresh
+// issues an earlier session's ID Token anew. A hint from an earlier session, which
 // any client holding an old ID Token could replay, never ends a newer one. A Logout Token, which carries an 'events'
 // claim, is never accepted as a hint.
 func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthelia2.RPInitiatedLogoutRequester, userSession *session.UserSession) bool {
@@ -118,8 +121,8 @@ func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthel
 			return false
 		}
 	} else {
-		iat, err := claims.GetIssuedAt()
-		if err != nil || iat == nil || iat.Unix() < userSession.PlusLoginTimestamp {
+		authTime, ok := oauth2ClaimUnix(claims, oidc.ClaimAuthenticationTime)
+		if !ok || authTime < userSession.PlusLoginTimestamp {
 			return false
 		}
 	}
@@ -135,6 +138,22 @@ func oauth2EndSessionHintMatches(ctx *middlewares.AutheliaCtx, requester oauthel
 	}
 
 	return opaque.Username == userSession.Username
+}
+
+// oauth2ClaimUnix returns a numeric date claim as a Unix time, and false if it's absent or not a number.
+func oauth2ClaimUnix(claims jwt.MapClaims, claim string) (unix int64, ok bool) {
+	switch value := claims[claim].(type) {
+	case float64:
+		return int64(value), true
+	case int64:
+		return value, true
+	case json.Number:
+		n, err := value.Int64()
+
+		return n, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func oauth2EndSessionRedirectPortal(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {

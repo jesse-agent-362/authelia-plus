@@ -20,7 +20,8 @@ type Store interface {
 	ReplacePlusUserSession(ctx context.Context, previous uuid.UUID, s model.PlusUserSession, revokedBy string) (ok bool, err error)
 	LoadPlusUserSession(ctx context.Context, id uuid.UUID) (s *model.PlusUserSession, err error)
 	LoadPlusUserSessionsActive(ctx context.Context, username string, now time.Time) (sessions []model.PlusUserSession, err error)
-	UpdatePlusUserSessionActivity(ctx context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (err error)
+	UpdatePlusUserSessionActivity(ctx context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (ok bool, err error)
+	LoadPlusUserSessionByRequestID(ctx context.Context, requestID string) (s *model.PlusUserSession, err error)
 	SavePlusUserSessionGrant(ctx context.Context, grant model.PlusUserSessionGrant) (ok bool, err error)
 	LoadPlusUserSessionGrants(ctx context.Context, id uuid.UUID) (grants []model.PlusUserSessionGrant, err error)
 	RevokePlusUserSession(ctx context.Context, id uuid.UUID, username, revokedBy string, now time.Time) (ok bool, err error)
@@ -60,6 +61,12 @@ const (
 	// late or stamped by a clock behind this one; every purgeInterval the whole retention is reloaded anyway. Instances
 	// sharing a store need their clocks synchronized, with NTP or the like, to well within this.
 	refreshOverlap = 5 * time.Minute
+
+	// reloadTimeout bounds the full reload of the revoked set, which loads the whole retention.
+	reloadTimeout = time.Minute
+
+	// reloadRetry is how long after a failed full reload it's tried again; the incremental refresh runs meanwhile.
+	reloadRetry = 5 * time.Minute
 
 	// processDelay is how long a revocation waits before it's processed. Every instance has stopped accepting the
 	// session by then, so no authorization in flight can still add a grant after the grants were revoked.

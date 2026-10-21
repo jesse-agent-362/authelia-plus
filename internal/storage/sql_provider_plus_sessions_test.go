@@ -121,7 +121,13 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 
 	require.Error(t, provider.SavePlusUserSession(ctx, john), "the id is the primary key")
 
-	require.NoError(t, provider.UpdatePlusUserSessionActivity(ctx, johnOther.ID, now.Add(time.Minute), now.Add(2*time.Hour)))
+	ok, err := provider.UpdatePlusUserSessionActivity(ctx, johnOther.ID, now.Add(time.Minute), now.Add(2*time.Hour))
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	ok, err = provider.UpdatePlusUserSessionActivity(ctx, uuid.New(), now.Add(time.Minute), now.Add(2*time.Hour))
+	require.NoError(t, err)
+	assert.False(t, ok, "no record matched")
 
 	sessions, err := provider.LoadPlusUserSessionsActive(ctx, "john", now)
 	require.NoError(t, err)
@@ -133,9 +139,18 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	require.Len(t, sessions, 1, "expired records are not listed")
 
-	ok, err := provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: john.ID, RequestID: "req1"})
+	ok, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: john.ID, RequestID: "req1"})
 	require.NoError(t, err)
 	assert.True(t, ok)
+
+	record, err := provider.LoadPlusUserSessionByRequestID(ctx, "req1")
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	assert.Equal(t, john.ID, record.ID)
+
+	record, err = provider.LoadPlusUserSessionByRequestID(ctx, "unknown")
+	require.NoError(t, err)
+	assert.Nil(t, record)
 
 	ok, err = provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: john.ID, RequestID: "req2", ClientID: "app", Subject: "sub", SID: "sid", Issuer: "https://auth.example.com"})
 	require.NoError(t, err)
@@ -163,7 +178,7 @@ func testSQLProviderPlusUserSessions(t *testing.T, provider *SQLProvider) {
 	require.NoError(t, err)
 	assert.False(t, ok)
 
-	record, err := provider.LoadPlusUserSession(ctx, harry.ID)
+	record, err = provider.LoadPlusUserSession(ctx, harry.ID)
 	require.NoError(t, err)
 	assert.False(t, record.RevokedAt.Valid)
 
@@ -493,6 +508,79 @@ func TestSQLProviderPlusUserSessionsRetryOrder(t *testing.T) {
 			ids, err := provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, now, now, 10)
 			require.NoError(t, err)
 			assert.Equal(t, []uuid.UUID{fresh.ID, failing.ID}, ids, "a record that failed goes after one never attempted")
+
+			// Logouts and switches go after the revocations by the user or an administrator, however old.
+			loggedOut, switched, cli := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now)
+
+			for _, s := range []model.PlusUserSession{loggedOut, switched, cli} {
+				require.NoError(t, provider.SavePlusUserSession(ctx, s))
+			}
+
+			for _, r := range []struct {
+				id uuid.UUID
+				by string
+				at time.Time
+			}{{loggedOut.ID, "logout", now.Add(-time.Hour)}, {switched.ID, "switched", now.Add(-2 * time.Hour)}, {cli.ID, "cli", now}} {
+				ok, err = provider.RevokePlusUserSession(ctx, r.id, "john", r.by, r.at)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+
+			ids, err = provider.LoadPlusUserSessionUnprocessedIDs(ctx, now, now, now, 10)
+			require.NoError(t, err)
+			assert.Equal(t, []uuid.UUID{fresh.ID, cli.ID, failing.ID, switched.ID, loggedOut.ID}, ids)
+		})
+	}
+}
+
+// The purge deletes the grants of exactly the records it deletes. A re-authentication moving grants to its new record
+// while the purge runs keeps them: a purge matching grants by their record being absent would delete them on
+// PostgreSQL, whose re-check of the moved rows still can't see the new record.
+func TestSQLProviderPlusUserSessionsPurgeWhileReplacing(t *testing.T) {
+	for name, provider := range newTestPlusProviders(t) {
+		if name == providerSQLite {
+			// SQLite serializes writers, so the two can't interleave.
+			continue
+		}
+
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Unix(1760000000, 0).UTC()
+
+			old, next := newTestPlusUserSession(t, "john", now), newTestPlusUserSession(t, "john", now)
+			require.NoError(t, provider.SavePlusUserSession(ctx, old))
+
+			ok, err := provider.SavePlusUserSessionGrant(ctx, model.PlusUserSessionGrant{SessionID: old.ID, RequestID: "req1"})
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			// The re-authentication's transaction, held open with the grant moved.
+			tx, err := provider.db.BeginTxx(ctx, nil)
+			require.NoError(t, err)
+
+			_, err = tx.ExecContext(ctx, provider.db.Rebind(queryPlusUserSessionReplaceClose), now, "replaced", now, old.ID, "john")
+			require.NoError(t, err)
+
+			_, err = tx.ExecContext(ctx, provider.db.Rebind(queryPlusUserSessionInsert), next.ID, next.Username, next.CreatedAt, next.LastActive, next.ExpiresAt, next.IP, next.UserAgent, 1)
+			require.NoError(t, err)
+
+			_, err = tx.ExecContext(ctx, provider.db.Rebind(queryPlusUserSessionGrantMove), next.ID, old.ID)
+			require.NoError(t, err)
+
+			purged := make(chan error, 1)
+
+			go func() {
+				purged <- provider.PurgePlusUserSessions(ctx, now.Add(-time.Hour), now.Add(-time.Hour))
+			}()
+
+			time.Sleep(200 * time.Millisecond)
+
+			require.NoError(t, tx.Commit())
+			require.NoError(t, <-purged)
+
+			grants, err := provider.LoadPlusUserSessionGrants(ctx, next.ID)
+			require.NoError(t, err)
+			assert.Len(t, grants, 1, "the moved grant survives the purge")
 		})
 	}
 }

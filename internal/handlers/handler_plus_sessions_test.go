@@ -195,6 +195,8 @@ func TestPlusSessionsFirstFactorPassword(t *testing.T) {
 		before := doTestPlusPasswordLogin(t, mock)
 
 		require.Equal(t, mock.Clock.Now().Unix(), before.PlusLoginTimestamp)
+		require.NotNil(t, before.OpenIDConnect)
+		require.Len(t, before.OpenIDConnect.SessionID, 32, "the 'sid' is minted at login")
 
 		mock.Clock.Set(mock.Clock.Now().Add(time.Hour))
 
@@ -210,6 +212,8 @@ func TestPlusSessionsFirstFactorPassword(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, mock.Clock.Now().Unix(), reauthenticated.FirstFactorAuthnTimestamp)
 		assert.Equal(t, before.PlusLoginTimestamp, reauthenticated.PlusLoginTimestamp, "re-authentication must not move the login time")
+		require.NotNil(t, reauthenticated.OpenIDConnect)
+		assert.Equal(t, before.OpenIDConnect.SessionID, reauthenticated.OpenIDConnect.SessionID, "nor the 'sid'")
 
 		mock.Clock.Set(mock.Clock.Now().Add(time.Hour))
 
@@ -217,6 +221,8 @@ func TestPlusSessionsFirstFactorPassword(t *testing.T) {
 
 		require.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
 		assert.Equal(t, mock.Clock.Now().Unix(), after.PlusLoginTimestamp, "a login moves the login time")
+		require.NotNil(t, after.OpenIDConnect)
+		assert.NotEqual(t, before.OpenIDConnect.SessionID, after.OpenIDConnect.SessionID, "and mints a new 'sid'")
 	})
 }
 
@@ -656,4 +662,122 @@ func TestPlusSessionsEndedWhenRefreshInvalidates(t *testing.T) {
 		assert.True(t, record.RevokedAt.Valid, "the record of a session destroyed for a deleted user is closed")
 		assert.Equal(t, plussessions.RevokedByLogout, record.RevokedBy)
 	})
+}
+
+// Revoking another session needs an elevated session, and revokes its tokens at once rather than leaving them to the
+// background processing.
+func TestPlusSessionsRevokeOtherSessions(t *testing.T) {
+	setup := func(t *testing.T, elevated bool) (mock *mocks.MockAutheliaCtx, userSession session.UserSession, other uuid.UUID) {
+		t.Helper()
+
+		mock = mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(2))
+
+		setupTestOIDCProvider(t, mock, nil)
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+		require.NotEqual(t, uuid.Nil, userSession.PlusID)
+
+		if elevated {
+			userSession.Elevations.User = &session.Elevation{RemoteIP: mock.Ctx.RemoteIP(), Expires: time.Now().Add(time.Hour)}
+
+			require.NoError(t, mock.Ctx.SaveSession(userSession))
+		}
+
+		other, err = mock.Ctx.Providers.PlusSessions.Create(mock.Ctx, userSession.Username, "192.0.2.1", "ua", false, mock.Ctx.GetSessionConfig(), uuid.Nil, "")
+		require.NoError(t, err)
+
+		ok, err := mock.PlusSessionsStore.SavePlusUserSessionGrant(mock.Ctx, model.PlusUserSessionGrant{SessionID: other, RequestID: "other-request-id", ClientID: "app"})
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		return mock, userSession, other
+	}
+
+	t.Run("ShouldRevokeTokensOfARevokedSessionAtOnce", func(t *testing.T) {
+		mock, _, other := setup(t, true)
+		defer mock.Close()
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"other-request-id"}).Times(1).Return(nil)
+
+		mock.Ctx.SetUserValue("sessionID", other.String())
+
+		PlusSessionDELETE(mock.Ctx)
+
+		assert.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.True(t, mock.PlusSessionsStore.Get(other).RevokedAt.Valid)
+		assert.False(t, mock.PlusSessionsStore.Get(other).ProcessedAt.Valid, "the Logout Tokens are left to the background processing")
+	})
+
+	t.Run("ShouldRevokeTokensOfOtherSessionsAtOnce", func(t *testing.T) {
+		mock, _, other := setup(t, true)
+		defer mock.Close()
+
+		mock.StorageMock.EXPECT().RevokeOAuth2SessionsByRequestIDs(gomock.Any(), []string{"other-request-id"}).Times(1).Return(nil)
+
+		PlusSessionsDELETE(mock.Ctx)
+
+		assert.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.True(t, mock.PlusSessionsStore.Get(other).RevokedAt.Valid)
+	})
+
+	t.Run("ShouldNotRevokeAnotherSessionWithoutElevation", func(t *testing.T) {
+		mock, _, other := setup(t, false)
+		defer mock.Close()
+
+		mock.Ctx.SetUserValue("sessionID", other.String())
+
+		PlusSessionDELETE(mock.Ctx)
+
+		assert.Equal(t, fasthttp.StatusForbidden, mock.Ctx.Response.StatusCode())
+		assert.JSONEq(t, `{"status":"KO","data":{"elevation":true,"first_factor":false,"second_factor":false}}`, string(mock.Ctx.Response.Body()))
+		assert.False(t, mock.PlusSessionsStore.Get(other).RevokedAt.Valid)
+	})
+
+	t.Run("ShouldRevokeTheCurrentSessionWithoutElevation", func(t *testing.T) {
+		mock, userSession, other := setup(t, false)
+		defer mock.Close()
+
+		mock.Ctx.SetUserValue("sessionID", userSession.PlusID.String())
+
+		PlusSessionDELETE(mock.Ctx)
+
+		assert.Equal(t, fasthttp.StatusOK, mock.Ctx.Response.StatusCode())
+		assert.True(t, mock.PlusSessionsStore.Get(userSession.PlusID).RevokedAt.Valid)
+		assert.False(t, mock.PlusSessionsStore.Get(other).RevokedAt.Valid)
+	})
+}
+
+// A code exchange or refresh for an authorization made in a session revoked since, on any instance, is refused: one
+// that passed the library's own checks before the tokens were revoked would otherwise mint new ones.
+func TestPlusSessionsTokenRequestForRevokedSession(t *testing.T) {
+	mock := mocks.NewMockAutheliaCtxWithUserSession(t, newTestOIDCUserSession(1))
+	defer mock.Close()
+
+	client := newTestOIDCAuthorizationCodeClient(t)
+	client.ConsentMode = "implicit"
+
+	setupTestOIDCAuthorizationCodeFlow(t, mock, client)
+
+	code := mustGetTestOIDCAuthorizationCode(t, mock, newTestOIDCAuthorizationValues())
+
+	userSession, err := mock.Ctx.GetSession()
+	require.NoError(t, err)
+
+	ok, err := mock.PlusSessionsStore.RevokePlusUserSession(mock.Ctx, userSession.PlusID, userSession.Username, plussessions.RevokedBySelf, time.Now())
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	rw, r := newTestOAuth2Request(t, fasthttp.MethodPost, testOIDCTokenEndpoint, url.Values{
+		testOIDCFormParameterGrantType:    []string{oidc.GrantTypeAuthorizationCode},
+		oidc.FormParameterClientID:        []string{testOIDCAuthorizationCodeID},
+		testOIDCFormParameterClientSecret: []string{testOIDCClientSecretValue},
+		testOIDCFormParameterCode:         []string{code},
+		oidc.FormParameterRedirectURI:     []string{testOIDCRedirectURI},
+	})
+
+	OAuth2TokenPOST(mock.Ctx, rw, r)
+
+	assert.Equal(t, http.StatusBadRequest, rw.Code)
+	assert.Equal(t, "invalid_grant", getTestOAuth2ErrorResponse(t, rw)["error"])
 }

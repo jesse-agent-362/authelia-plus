@@ -82,17 +82,31 @@ func newTestPlusRouter(t *testing.T) *testPlusRouter {
 func (r *testPlusRouter) login(t *testing.T, username string, secondFactor bool) (id uuid.UUID, cookie *fasthttp.Cookie) {
 	t.Helper()
 
+	return r.loginElevated(t, username, secondFactor, false)
+}
+
+// loginElevated is login, with the session elevated if elevated is true.
+func (r *testPlusRouter) loginElevated(t *testing.T, username string, secondFactor, elevated bool) (id uuid.UUID, cookie *fasthttp.Cookie) {
+	t.Helper()
+
 	s, err := r.providers.SessionProvider.Get("example.com")
 	require.NoError(t, err)
 
 	id, err = r.providers.PlusSessions.Create(context.Background(), username, "192.0.2.1", "ua", false, s.Config, uuid.Nil, "")
 	require.NoError(t, err)
 
-	return id, r.save(t, username, secondFactor, id)
+	return id, r.saveElevated(t, username, secondFactor, elevated, id)
 }
 
 // save stores a session at the given level with the given record ID, and returns the cookie for it.
 func (r *testPlusRouter) save(t *testing.T, username string, secondFactor bool, id uuid.UUID) (cookie *fasthttp.Cookie) {
+	t.Helper()
+
+	return r.saveElevated(t, username, secondFactor, false, id)
+}
+
+// saveElevated is save, with the session elevated if elevated is true.
+func (r *testPlusRouter) saveElevated(t *testing.T, username string, secondFactor, elevated bool, id uuid.UUID) (cookie *fasthttp.Cookie) {
 	t.Helper()
 
 	s, err := r.providers.SessionProvider.Get("example.com")
@@ -106,6 +120,10 @@ func (r *testPlusRouter) save(t *testing.T, username string, secondFactor bool, 
 	userSession.AuthenticationMethodRefs.TOTP = secondFactor
 	userSession.LastActivity = time.Now().Unix()
 	userSession.PlusID = id
+
+	if elevated {
+		userSession.Elevations.User = &session.Elevation{RemoteIP: middlewares.RequestCtxRemoteIP(&fasthttp.RequestCtx{}), Expires: time.Now().Add(time.Hour)}
+	}
 
 	require.NoError(t, s.SaveSession(ctx, userSession))
 
@@ -157,7 +175,7 @@ func (r *testPlusRouter) do(method, path string, cookie *fasthttp.Cookie) *fasth
 func TestHandlerMainPlusSessions(t *testing.T) {
 	r := newTestPlusRouter(t)
 
-	id, cookie := r.login(t, "john", true)
+	id, cookie := r.loginElevated(t, "john", true, true)
 	other, _ := r.login(t, "harry", true)
 
 	assert.Equal(t, fasthttp.StatusOK, r.authz(cookie))
@@ -209,7 +227,7 @@ func TestHandlerMainPlusSessions(t *testing.T) {
 func TestHandlerMainPlusSessionsRevokeOthers(t *testing.T) {
 	r := newTestPlusRouter(t)
 
-	current, cookie := r.login(t, "john", true)
+	current, cookie := r.loginElevated(t, "john", true, true)
 	other, otherCookie := r.login(t, "john", true)
 	hidden, hiddenCookie := r.login(t, "john", true)
 	harry, harryCookie := r.login(t, "harry", true)
@@ -238,6 +256,32 @@ func TestHandlerMainPlusSessionsRevokeOthers(t *testing.T) {
 	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions", cookie)
 	assert.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
 	assert.JSONEq(t, `{"status":"OK","data":{"count":0}}`, string(ctx.Response.Body()))
+}
+
+// Revoking another session needs an elevated session on top of the full authentication, so a stolen session can't keep
+// revoking the one its user logs in with. Revoking the current one is a logout and doesn't. The 403 tells the UI to
+// elevate rather than to complete the second factor.
+func TestHandlerMainPlusSessionsRequireElevation(t *testing.T) {
+	r := newTestPlusRouter(t)
+
+	current, cookie := r.login(t, "john", true)
+	other, _ := r.login(t, "john", true)
+
+	const elevation = `{"status":"KO","data":{"elevation":true,"first_factor":false,"second_factor":false}}`
+
+	ctx := r.do(fasthttp.MethodDelete, "/api/plus/sessions", cookie)
+	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
+	assert.JSONEq(t, elevation, string(ctx.Response.Body()))
+
+	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions/"+other.String(), cookie)
+	assert.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode())
+	assert.JSONEq(t, elevation, string(ctx.Response.Body()))
+
+	assert.False(t, r.records.Get(other).RevokedAt.Valid)
+
+	ctx = r.do(fasthttp.MethodDelete, "/api/plus/sessions/"+current.String(), cookie)
+	assert.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
+	assert.True(t, r.records.Get(current).RevokedAt.Valid)
 }
 
 // Item 3: an authenticated session saved before the records existed has no record to revoke, so it's anonymous.

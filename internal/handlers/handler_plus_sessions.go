@@ -14,11 +14,14 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 
+	oauthelia2 "authelia.com/provider/oauth2"
+
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
 	"github.com/authelia/authelia/v4/internal/middlewares"
 	"github.com/authelia/authelia/v4/internal/model"
 	"github.com/authelia/authelia/v4/internal/oidc"
 	plussessions "github.com/authelia/authelia/v4/internal/plus/sessions"
+	"github.com/authelia/authelia/v4/internal/random"
 	"github.com/authelia/authelia/v4/internal/session"
 	"github.com/authelia/authelia/v4/internal/storage"
 )
@@ -87,6 +90,9 @@ func PlusSessionsGET(ctx *middlewares.AutheliaCtx) {
 
 // PlusSessionDELETE revokes one of the logged in user's sessions. A session which doesn't exist and one which belongs
 // to someone else get the same 404, so the endpoint can't be used to probe for IDs.
+//
+// Revoking another session needs an elevated session, so a stolen session can't keep revoking the one its user logs
+// in with before that one reaches the second factor. Revoking the current session is a logout, and doesn't.
 func PlusSessionDELETE(ctx *middlewares.AutheliaCtx) {
 	userSession, ok := plusSessionsUserSession(ctx)
 	if !ok {
@@ -103,7 +109,20 @@ func PlusSessionDELETE(ctx *middlewares.AutheliaCtx) {
 		return
 	}
 
-	if ok, err = ctx.Providers.PlusSessions.Revoke(ctx, id, userSession.Username); err != nil {
+	if id == userSession.PlusID {
+		plusSessionRevoke(ctx, userSession, id)
+
+		return
+	}
+
+	middlewares.RequireElevated(func(ctx *middlewares.AutheliaCtx) {
+		plusSessionRevoke(ctx, userSession, id)
+	})(ctx)
+}
+
+func plusSessionRevoke(ctx *middlewares.AutheliaCtx, userSession session.UserSession, id uuid.UUID) {
+	ok, err := ctx.Providers.PlusSessions.Revoke(ctx, id, userSession.Username)
+	if err != nil {
 		ctx.Logger.WithError(err).Errorf("Error occurred revoking session '%s' of user '%s'", id, userSession.Username)
 
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
@@ -121,18 +140,21 @@ func PlusSessionDELETE(ctx *middlewares.AutheliaCtx) {
 
 	ctx.Logger.WithFields(map[string]any{"username": userSession.Username, "session": id.String(), "current": id == userSession.PlusID}).Info("User revoked a session")
 
+	plusSessionsRevokeNow(ctx, userSession.Username, id)
+
 	ctx.ReplyOK()
 }
 
 // PlusSessionsDELETE revokes every session of the logged in user but the current one, including live sessions the list
-// hides because a lagging activity write left them looking expired, and responds with how many it revoked.
+// hides because a lagging activity write left them looking expired, and responds with how many it revoked. The route
+// needs an elevated session.
 func PlusSessionsDELETE(ctx *middlewares.AutheliaCtx) {
 	userSession, ok := plusSessionsUserSession(ctx)
 	if !ok {
 		return
 	}
 
-	count, err := ctx.Providers.PlusSessions.RevokeOthers(ctx, userSession.Username, userSession.PlusID)
+	count, ids, err := ctx.Providers.PlusSessions.RevokeOthers(ctx, userSession.Username, userSession.PlusID)
 	if err != nil {
 		ctx.Logger.WithError(err).Errorf("Error occurred revoking the other sessions of user '%s'", userSession.Username)
 
@@ -143,6 +165,8 @@ func PlusSessionsDELETE(ctx *middlewares.AutheliaCtx) {
 	}
 
 	ctx.Logger.WithFields(map[string]any{"username": userSession.Username, "count": count}).Info("User revoked their other sessions")
+
+	plusSessionsRevokeNow(ctx, userSession.Username, ids...)
 
 	if err = ctx.SetJSONBody(PlusSessionsRevokedResponse{Count: count}); err != nil {
 		ctx.Logger.WithError(err).Errorf("Error occurred encoding the revoked sessions count of user '%s'", userSession.Username)
@@ -187,8 +211,10 @@ func plusSessionsCreate(ctx *middlewares.AutheliaCtx, config schema.SessionCooki
 
 	// A re-authentication keeps the session's login time; a login, which starts a new session, or a switch of user
 	// doesn't.
+	// The OpenID Connect 1.0 'sid' is minted with it, once, so concurrent first authorizations can't each mint their own.
 	if previous == uuid.Nil || previousUsername != username || userSession.PlusLoginTimestamp == 0 {
 		userSession.PlusLoginTimestamp = ctx.GetClock().Now().Unix()
+		userSession.OpenIDConnect = &session.OpenIDConnectLogout{SessionID: ctx.Providers.Random.StringCustom(32, random.CharSetAlphaNumeric)}
 	}
 
 	return nil
@@ -266,6 +292,66 @@ func plusSessionsRevokeGrants(ctx context.Context, provider *oidc.OpenIDConnectP
 	}
 
 	return err
+}
+
+// plusSessionsRevokeNow revokes the tokens of revoked records' grants right away, so a backlog of revocations to
+// process can't leave them live. That's best effort, as on logout: the background processing revokes the grants again
+// and sends their Logout Tokens.
+func plusSessionsRevokeNow(ctx *middlewares.AutheliaCtx, username string, ids ...uuid.UUID) {
+	if ctx.Providers.OpenIDConnect == nil || len(ids) == 0 {
+		return
+	}
+
+	grants, err := ctx.Providers.PlusSessions.Grants(ctx, ids...)
+	if err != nil {
+		ctx.Logger.WithError(err).Errorf("Error occurred loading the grants of the revoked sessions of user '%s', they'll be revoked in the background", username)
+
+		return
+	}
+
+	requestIDs := plusSessionsRequestIDs(grants)
+	if len(requestIDs) == 0 {
+		return
+	}
+
+	if err = ctx.Providers.StorageProvider.RevokeOAuth2SessionsByRequestIDs(ctx, requestIDs); err != nil {
+		ctx.Logger.WithError(err).Errorf("Error occurred revoking the OpenID Connect 1.0 tokens of the revoked sessions of user '%s', they'll be revoked in the background", username)
+	}
+}
+
+// plusSessionsCheckAccessRequest refuses a token request whose authorization was made in a session since revoked. A
+// refresh or code exchange which passed its own checks before the revocation's tokens were revoked would otherwise
+// mint tokens under the same request ID after them. One that passes this check finishes long before the revocation is
+// processed in the background, which revokes the request's tokens again. authelia-plus.
+func plusSessionsCheckAccessRequest(ctx *middlewares.AutheliaCtx, requester oauthelia2.AccessRequester) (err error) {
+	if ctx.Providers.PlusSessions == nil {
+		return nil
+	}
+
+	var revoked bool
+
+	if revoked, err = ctx.Providers.PlusSessions.RequestRevoked(ctx, requester.GetID()); err != nil {
+		return oauthelia2.ErrServerError.WithWrap(err).WithDebugError(err)
+	}
+
+	if revoked {
+		return oauthelia2.ErrInvalidGrant.WithDebug("The session the authorization was made in has been revoked.")
+	}
+
+	return nil
+}
+
+// plusSessionsRequestIDs returns the request IDs of the grants.
+func plusSessionsRequestIDs(grants []model.PlusUserSessionGrant) (requestIDs []string) {
+	requestIDs = make([]string, 0, len(grants))
+
+	for _, grant := range grants {
+		if grant.RequestID != "" {
+			requestIDs = append(requestIDs, grant.RequestID)
+		}
+	}
+
+	return requestIDs
 }
 
 // plusSessionsGrantsWithoutClients returns the grants with their Back-Channel Logout clients removed.

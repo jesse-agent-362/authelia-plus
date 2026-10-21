@@ -197,21 +197,50 @@ func (m *Manager) Revoke(ctx context.Context, id uuid.UUID, username string) (ok
 }
 
 // RevokeOthers revokes every session record of username but the one with the ID current, and returns how many it
-// revoked. The sessions are rejected by this instance immediately.
-func (m *Manager) RevokeOthers(ctx context.Context, username string, current uuid.UUID) (count int64, err error) {
+// revoked and the IDs of that user's other records whose revocation is not yet processed. The sessions are rejected by
+// this instance immediately.
+func (m *Manager) RevokeOthers(ctx context.Context, username string, current uuid.UUID) (count int64, ids []uuid.UUID, err error) {
 	now := m.clock.Now().UTC()
 
-	var ids []uuid.UUID
-
 	if count, ids, err = m.store.RevokeOtherPlusUserSessions(ctx, username, current, RevokedBySelf, now); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	for _, id := range ids {
 		m.markRevoked(id, now)
 	}
 
-	return count, nil
+	return count, ids, nil
+}
+
+// Grants returns the grants of the records with these IDs, for the caller of a revoke to revoke right away. That's best
+// effort, as for a logout: the revocations are processed in the background as well.
+func (m *Manager) Grants(ctx context.Context, ids ...uuid.UUID) (grants []model.PlusUserSessionGrant, err error) {
+	for _, id := range ids {
+		var g []model.PlusUserSessionGrant
+
+		if g, err = m.store.LoadPlusUserSessionGrants(ctx, id); err != nil {
+			return nil, err
+		}
+
+		grants = append(grants, g...)
+	}
+
+	return grants, nil
+}
+
+// RequestRevoked reports whether the session record holding the grant of an authorization request is revoked, read
+// from the store so a revoke on any instance counts at once. A request no record holds is not revoked. A token refresh
+// must be refused for a revoked one: a refresh that started before the revoke was processed could otherwise mint
+// tokens the processing doesn't see.
+func (m *Manager) RequestRevoked(ctx context.Context, requestID string) (revoked bool, err error) {
+	var record *model.PlusUserSession
+
+	if record, err = m.store.LoadPlusUserSessionByRequestID(ctx, requestID); err != nil || record == nil {
+		return false, err
+	}
+
+	return record.RevokedAt.Valid || m.Revoked(record.ID), nil
 }
 
 // RecordGrant adds an OAuth 2.0 authorization request to the record of the session it was made in, so revoking the
@@ -298,7 +327,8 @@ func RevokeUser(ctx context.Context, store Store, username string, now time.Time
 
 // refresh adds the IDs revoked since the latest revocation it saw, less refreshOverlap, to the revoked set. Every
 // purgeInterval it loads the IDs revoked within the whole retention instead, and forgets the IDs seen longer ago than
-// that. On error the set is left as it was.
+// that. A failed full reload falls back to the incremental refresh and is retried after reloadRetry, so it can never
+// stop the set from learning of new revocations. On error the set is left as it was.
 func (m *Manager) refresh(ctx context.Context) (err error) {
 	now := m.clock.Now().UTC()
 
@@ -306,15 +336,30 @@ func (m *Manager) refresh(ctx context.Context) (err error) {
 	latest, full := m.latest, now.Sub(m.reloaded) >= purgeInterval
 	m.mu.RUnlock()
 
-	since := latest.Add(-refreshOverlap)
-
 	if full || latest.IsZero() {
-		since = now.Add(-m.retention)
+		if err = m.load(ctx, now, now.Add(-m.retention), reloadTimeout, full); err == nil || latest.IsZero() {
+			return err
+		}
+
+		m.log.WithError(err).Warn("Error occurred reloading every revoked user session, refreshing the recent revocations only")
+
+		m.mu.Lock()
+		m.reloaded = now.Add(reloadRetry - purgeInterval)
+		m.mu.Unlock()
 	}
+
+	return m.load(ctx, now, latest.Add(-refreshOverlap), storeTimeout, false)
+}
+
+// load adds the IDs revoked since since to the revoked set. A full load, of the whole retention, also forgets the IDs
+// seen longer ago than the retention.
+func (m *Manager) load(ctx context.Context, now, since time.Time, timeout time.Duration, full bool) (err error) {
+	lctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	var revocations []model.PlusUserSessionRevocation
 
-	if revocations, err = m.store.LoadPlusUserSessionRevocations(ctx, since); err != nil {
+	if revocations, err = m.store.LoadPlusUserSessionRevocations(lctx, since); err != nil {
 		return err
 	}
 

@@ -514,6 +514,43 @@ func TestOAuth2EndSession(t *testing.T) {
 		assertLoggedIn(t, mock, true)
 	})
 
+	t.Run("ShouldNotLogoutWithRefreshedIDTokenHintFromAnEarlierLogin", func(t *testing.T) {
+		mock := setup(t)
+		defer mock.Close()
+
+		userSession, err := mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		authenticated := time.Now().Add(-time.Hour).Unix()
+
+		userSession.FirstFactorAuthnTimestamp = authenticated
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		// Issued now, as a refresh issues it, but authenticated by an earlier login.
+		hint := mustGetTestOIDCIDToken(t, mock)
+
+		_, claims := mustDecodeTestJWT(t, hint)
+		require.Equal(t, float64(authenticated), claims[oidc.ClaimAuthenticationTime])
+		require.Greater(t, claims[oidc.ClaimIssuedAt], float64(authenticated+60))
+
+		userSession, err = mock.Ctx.GetSession()
+		require.NoError(t, err)
+
+		userSession.PlusLoginTimestamp = authenticated + 60
+
+		require.NoError(t, mock.Ctx.SaveSession(userSession))
+
+		code, location := endSession(t, mock, fasthttp.MethodGet, url.Values{
+			testOIDCFormParameterIDTokenHint:           []string{hint},
+			testOIDCFormParameterPostLogoutRedirectURI: []string{testOIDCPostLogoutRedirectURI},
+		})
+
+		assert.Equal(t, http.StatusFound, code)
+		assert.Equal(t, testOIDCPortalURL, location)
+		assertLoggedIn(t, mock, true)
+	})
+
 	t.Run("ShouldLogoutWithIDTokenHintFromBeforeReauthentication", func(t *testing.T) {
 		mock := setup(t)
 		defer mock.Close()

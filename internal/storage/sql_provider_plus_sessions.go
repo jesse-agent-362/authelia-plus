@@ -9,9 +9,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rpadovani/sqlx-v2"
 
 	"github.com/authelia/authelia/v4/internal/model"
 )
@@ -21,6 +23,9 @@ import (
 // The table is created at startup rather than by a numbered migration, so it can't collide with upstream's migration
 // numbers. These methods are deliberately not part of the Provider interface; the plus code reaches them by type
 // assertion.
+
+// plusPurgeBatch bounds the records purged per statement, well below every dialect's limit on parameters.
+const plusPurgeBatch = 100
 
 const (
 	tablePlusUserSession      = "plus_user_session"
@@ -132,6 +137,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);`
 
 	queryPlusUserSessionSelectByID = `SELECT ` + queryPlusUserSessionColumns + ` FROM plus_user_session WHERE id = ?;`
 
+	queryPlusUserSessionSelectByRequestID = `
+SELECT ` + queryPlusUserSessionColumns + `
+FROM plus_user_session
+WHERE id = (SELECT session_id FROM plus_user_session_grant WHERE request_id = ? LIMIT 1);`
+
 	queryPlusUserSessionSelectActiveByUsername = `
 SELECT ` + queryPlusUserSessionColumns + `
 FROM plus_user_session
@@ -206,12 +216,14 @@ WHERE id = ? AND username = ? AND processed_at IS NULL;`
 
 	queryPlusUserSessionSelectRevokedIDs = `SELECT id, revoked_at FROM plus_user_session WHERE revoked_at IS NOT NULL AND revoked_at > ?;`
 
+	// queryPlusUserSessionSelectUnprocessedIDs takes the revocations by the user or an administrator first, so a backlog
+	// of logouts, whose tokens the logout already revoked, can't hold them up.
 	queryPlusUserSessionSelectUnprocessedIDs = `
 SELECT id
 FROM plus_user_session
 WHERE revoked_at IS NOT NULL AND revoked_at <= ? AND processed_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?)
     AND (retry_at IS NULL OR retry_at <= ?)
-ORDER BY attempts, revoked_at
+ORDER BY CASE WHEN revoked_by IN ('self', 'cli') THEN 0 ELSE 1 END, attempts, revoked_at
 LIMIT ?;`
 
 	// queryPlusUserSessionClaim leases a revoked record to one instance. A lease older than the cutoff is taken over,
@@ -225,15 +237,23 @@ WHERE id = ? AND revoked_at IS NOT NULL AND processed_at IS NULL AND (claimed_at
 
 	queryPlusUserSessionUnclaim = `UPDATE plus_user_session SET claimed_at = NULL, retry_at = ? WHERE id = ? AND processed_at IS NULL;`
 
-	// queryPlusUserSessionPurge never deletes a revoked record before it is processed: its grants' tokens can outlive
-	// the retention.
-	queryPlusUserSessionPurge = `
-DELETE FROM plus_user_session
+	// queryPlusUserSessionSelectPurge never selects a revoked record before it is processed: its grants' tokens can
+	// outlive the retention. The delete checks the same again.
+	queryPlusUserSessionSelectPurge = `
+SELECT id
+FROM plus_user_session
 WHERE (revoked_at IS NOT NULL AND revoked_at < ? AND processed_at IS NOT NULL) OR (revoked_at IS NULL AND expires_at < ?);`
 
-	queryPlusUserSessionGrantPurge = `
+	queryPlusUserSessionPurgeByIDs = `
+DELETE FROM plus_user_session
+WHERE id IN (?) AND ((revoked_at IS NOT NULL AND revoked_at < ? AND processed_at IS NOT NULL) OR (revoked_at IS NULL AND expires_at < ?));`
+
+	// queryPlusUserSessionGrantPurgeByIDs deletes only the grants of records the purge deleted: a record whose
+	// deletion the re-check refused keeps them, and grants a concurrent re-authentication moved to its new record no
+	// longer match.
+	queryPlusUserSessionGrantPurgeByIDs = `
 DELETE FROM plus_user_session_grant
-WHERE session_id NOT IN (SELECT id FROM plus_user_session);`
+WHERE session_id IN (?) AND session_id NOT IN (SELECT id FROM plus_user_session WHERE id IN (?));`
 )
 
 // PlusUserSessionsSchemaEnsure creates the plus_user_session and plus_user_session_grant tables and their indexes if
@@ -293,13 +313,33 @@ func (p *SQLProvider) LoadPlusUserSessionsActive(ctx context.Context, username s
 	return sessions, nil
 }
 
-// UpdatePlusUserSessionActivity records the last activity and expiration of an unrevoked user session record.
-func (p *SQLProvider) UpdatePlusUserSessionActivity(ctx context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (err error) {
-	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionUpdateActivity), lastActive, expiresAt, id); err != nil {
-		return fmt.Errorf("error updating activity of user session record '%s': %w", id, err)
+// UpdatePlusUserSessionActivity records the last activity and expiration of an unrevoked user session record. It
+// reports whether a row was affected; MySQL doesn't count a row whose values didn't change, so false alone doesn't
+// prove the record is missing or revoked.
+func (p *SQLProvider) UpdatePlusUserSessionActivity(ctx context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (ok bool, err error) {
+	var result sql.Result
+
+	if result, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionUpdateActivity), lastActive, expiresAt, id); err != nil {
+		return false, fmt.Errorf("error updating activity of user session record '%s': %w", id, err)
 	}
 
-	return nil
+	return plusRowsAffected(result)
+}
+
+// LoadPlusUserSessionByRequestID loads the user session record holding the grant of an authorization request. It
+// returns nil when no record holds it.
+func (p *SQLProvider) LoadPlusUserSessionByRequestID(ctx context.Context, requestID string) (s *model.PlusUserSession, err error) {
+	s = &model.PlusUserSession{}
+
+	if err = p.db.GetContext(ctx, s, p.db.Rebind(queryPlusUserSessionSelectByRequestID), requestID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("error selecting the user session record of request '%s': %w", requestID, err)
+	}
+
+	return s, nil
 }
 
 // SavePlusUserSessionGrant adds a grant to a user session record. It reports false when the record is missing or
@@ -513,14 +553,42 @@ func (p *SQLProvider) UnclaimPlusUserSession(ctx context.Context, id uuid.UUID, 
 }
 
 // PurgePlusUserSessions deletes the processed user session records revoked before revokedBefore, the unrevoked ones which
-// expired before expiredBefore, and the grants of deleted records.
+// expired before expiredBefore, and the grants of exactly those records, in one transaction.
 func (p *SQLProvider) PurgePlusUserSessions(ctx context.Context, revokedBefore, expiredBefore time.Time) (err error) {
-	if _, err = p.db.ExecContext(ctx, p.db.Rebind(queryPlusUserSessionPurge), revokedBefore, expiredBefore); err != nil {
-		return fmt.Errorf("error purging user session records: %w", err)
-	}
+	err = p.plusTx(ctx, func(tx SQLXTx) (err error) {
+		var ids []uuid.UUID
 
-	if _, err = p.db.ExecContext(ctx, queryPlusUserSessionGrantPurge); err != nil {
-		return fmt.Errorf("error purging user session grants: %w", err)
+		if err = tx.SelectContext(ctx, &ids, p.db.Rebind(queryPlusUserSessionSelectPurge), revokedBefore, expiredBefore); err != nil {
+			return err
+		}
+
+		for chunk := range slices.Chunk(ids, plusPurgeBatch) {
+			var (
+				query string
+				args  []any
+			)
+
+			if query, args, err = sqlx.In(queryPlusUserSessionPurgeByIDs, chunk, revokedBefore, expiredBefore); err != nil {
+				return err
+			}
+
+			if _, err = tx.ExecContext(ctx, p.db.Rebind(query), args...); err != nil {
+				return err
+			}
+
+			if query, args, err = sqlx.In(queryPlusUserSessionGrantPurgeByIDs, chunk, chunk); err != nil {
+				return err
+			}
+
+			if _, err = tx.ExecContext(ctx, p.db.Rebind(query), args...); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error purging user session records: %w", err)
 	}
 
 	return nil

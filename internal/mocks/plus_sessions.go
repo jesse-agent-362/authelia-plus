@@ -34,6 +34,9 @@ type PlusSessionsStore struct {
 
 	// RevocationsSince records the since argument of each LoadPlusUserSessionRevocations call.
 	RevocationsSince []time.Time
+
+	// RevocationsError, when set, is the error of a LoadPlusUserSessionRevocations call by its since argument.
+	RevocationsError func(since time.Time) error
 }
 
 // Get returns a copy of the record with this ID, or nil.
@@ -118,19 +121,43 @@ func (s *PlusSessionsStore) LoadPlusUserSessionsActive(_ context.Context, userna
 	return records, nil
 }
 
-func (s *PlusSessionsStore) UpdatePlusUserSessionActivity(_ context.Context, id uuid.UUID, lastActive, expiresAt time.Time) error {
+func (s *PlusSessionsStore) UpdatePlusUserSessionActivity(_ context.Context, id uuid.UUID, lastActive, expiresAt time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.Errors["UpdatePlusUserSessionActivity"]; err != nil {
-		return err
+		return false, err
 	}
 
-	if r, ok := s.Records[id]; ok && !r.RevokedAt.Valid {
-		r.LastActive, r.ExpiresAt = lastActive, expiresAt
+	r, ok := s.Records[id]
+	if !ok || r.RevokedAt.Valid {
+		return false, nil
 	}
 
-	return nil
+	r.LastActive, r.ExpiresAt = lastActive, expiresAt
+
+	return true, nil
+}
+
+func (s *PlusSessionsStore) LoadPlusUserSessionByRequestID(_ context.Context, requestID string) (*model.PlusUserSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.Errors["LoadPlusUserSessionByRequestID"]; err != nil {
+		return nil, err
+	}
+
+	for _, g := range s.Grants {
+		if g.RequestID == requestID {
+			if r, ok := s.Records[g.SessionID]; ok {
+				c := *r
+
+				return &c, nil
+			}
+		}
+	}
+
+	return nil, nil
 }
 
 func (s *PlusSessionsStore) ReplacePlusUserSession(_ context.Context, previous uuid.UUID, r model.PlusUserSession, revokedBy string) (bool, error) {
@@ -307,6 +334,12 @@ func (s *PlusSessionsStore) LoadPlusUserSessionRevocations(_ context.Context, si
 		return nil, err
 	}
 
+	if s.RevocationsError != nil {
+		if err = s.RevocationsError(since); err != nil {
+			return nil, err
+		}
+	}
+
 	for id, r := range s.Records {
 		if r.RevokedAt.Valid && r.RevokedAt.Time.After(since) {
 			revocations = append(revocations, model.PlusUserSessionRevocation{ID: id, RevokedAt: r.RevokedAt.Time})
@@ -333,6 +366,10 @@ func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context,
 	}
 
 	sort.Slice(due, func(i, j int) bool {
+		if pi, pj := mockPlusPriority(due[i]), mockPlusPriority(due[j]); pi != pj {
+			return pi < pj
+		}
+
 		if due[i].Attempts != due[j].Attempts {
 			return due[i].Attempts < due[j].Attempts
 		}
@@ -345,6 +382,14 @@ func (s *PlusSessionsStore) LoadPlusUserSessionUnprocessedIDs(_ context.Context,
 	}
 
 	return ids, nil
+}
+
+func mockPlusPriority(r *model.PlusUserSession) int {
+	if r.RevokedBy == "self" || r.RevokedBy == "cli" {
+		return 0
+	}
+
+	return 1
 }
 
 func (s *PlusSessionsStore) ClaimPlusUserSession(_ context.Context, id uuid.UUID, now, leaseBefore time.Time) (bool, error) {

@@ -61,21 +61,46 @@ func (m *Manager) write(ctx context.Context) {
 		case a := <-m.writes:
 			wctx, cancel := context.WithTimeout(ctx, storeTimeout)
 
-			if err := m.store.UpdatePlusUserSessionActivity(wctx, a.id, a.lastActive, a.expiresAt); err != nil {
-				m.log.WithError(err).Warn("Error occurred recording user session activity")
-			}
+			m.writeActivity(wctx, a)
 
 			cancel()
 		}
 	}
 }
 
+// writeActivity records a session's activity on its record. A session whose record is missing, after a database restore
+// or a purge, or revoked is rejected from then on: it could never be listed nor revoked.
+func (m *Manager) writeActivity(ctx context.Context, a activity) {
+	ok, err := m.store.UpdatePlusUserSessionActivity(ctx, a.id, a.lastActive, a.expiresAt)
+	if err != nil {
+		m.log.WithError(err).Warn("Error occurred recording user session activity")
+
+		return
+	}
+
+	if ok {
+		return
+	}
+
+	// MySQL reports no row affected when the values didn't change, so the record is looked up before the session is
+	// rejected.
+	record, err := m.store.LoadPlusUserSession(ctx, a.id)
+	if err != nil {
+		m.log.WithError(err).Warn("Error occurred loading the record of a user session whose activity matched no record")
+
+		return
+	}
+
+	if record == nil || record.RevokedAt.Valid {
+		m.log.Warnf("Rejecting the user session '%s' as its record is missing or revoked", a.id)
+
+		m.markRevoked(a.id, m.clock.Now().UTC())
+	}
+}
+
 // refreshPoll refreshes the revoked set and forgets the activity writes older than touchInterval.
 func (m *Manager) refreshPoll(ctx context.Context) {
-	pctx, cancel := context.WithTimeout(ctx, storeTimeout)
-	defer cancel()
-
-	if err := m.refresh(pctx); err != nil {
+	if err := m.refresh(ctx); err != nil {
 		m.log.WithError(err).Error("Error occurred refreshing the revoked user sessions, keeping the last known set")
 	}
 

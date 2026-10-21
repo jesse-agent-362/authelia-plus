@@ -88,6 +88,14 @@ func OAuth2TokenPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *
 		return
 	}
 
+	if err = plusSessionsCheckAccessRequest(ctx, requester); err != nil {
+		ctx.GetLogger().Errorf("Access Request with id '%s' on client with id '%s' failed with error: %s", requester.GetID(), client.GetID(), oauthelia2.ErrorToDebugRFC6749Error(err))
+
+		ctx.Providers.OpenIDConnect.WriteAccessError(ctx, rw, requester, err)
+
+		return
+	}
+
 	ctx.GetLogger().Tracef("Access Request with id '%s' on client with id '%s' response is being generated for session with type '%T'", requester.GetID(), client.GetID(), requester.GetSession())
 
 	if responder, err = ctx.Providers.OpenIDConnect.NewAccessResponse(ctx, requester); err != nil {

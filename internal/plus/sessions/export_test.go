@@ -27,6 +27,18 @@ func Backoff(attempts int) time.Duration {
 	return backoff(attempts)
 }
 
+// DrainWrites performs the queued activity writes.
+func (m *Manager) DrainWrites(ctx context.Context) {
+	for {
+		select {
+		case a := <-m.writes:
+			m.writeActivity(ctx, a)
+		default:
+			return
+		}
+	}
+}
+
 // SetLogger sets the logger the manager logs to.
 func (m *Manager) SetLogger(logger *logrus.Logger) {
 	m.log = logrus.NewEntry(logger)
@@ -56,4 +68,5 @@ const (
 	ProcessDelay   = processDelay
 	TouchInterval  = touchInterval
 	WriteQueue     = writeQueue
+	ReloadRetry    = reloadRetry
 )
