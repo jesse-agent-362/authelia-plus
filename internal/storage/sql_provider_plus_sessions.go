@@ -123,11 +123,16 @@ CREATE TABLE IF NOT EXISTS plus_user_session_grant (
     subject VARCHAR(255) NOT NULL DEFAULT '',
     sid VARCHAR(64) NOT NULL DEFAULT '',
     issuer VARCHAR(512) NOT NULL DEFAULT '',
-    PRIMARY KEY (session_id, request_id)
+    PRIMARY KEY (session_id, request_id),
+    INDEX plus_user_session_grant_request_id (request_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_520_ci;`
 
 	queryPlusUserSessionCreateIndexUsername  = `CREATE INDEX IF NOT EXISTS plus_user_session_username ON plus_user_session (username);`
 	queryPlusUserSessionCreateIndexRevokedAt = `CREATE INDEX IF NOT EXISTS plus_user_session_revoked_at ON plus_user_session (revoked_at);`
+
+	// queryPlusUserSessionGrantCreateIndexRequestID serves the token endpoint's lookup of a grant's record by request ID,
+	// which the primary key, led by session_id, can't.
+	queryPlusUserSessionGrantCreateIndexRequestID = `CREATE INDEX IF NOT EXISTS plus_user_session_grant_request_id ON plus_user_session_grant (request_id);`
 
 	queryPlusUserSessionColumns = `id, username, created_at, last_active, expires_at, ip, user_agent, grants, revoked_at, revoked_by, claimed_at, processed_at, attempts, retry_at`
 
@@ -265,9 +270,9 @@ func (p *SQLProvider) PlusUserSessionsSchemaEnsure(ctx context.Context) (err err
 	case providerMySQL:
 		queries = []string{queryPlusUserSessionCreateMySQL, queryPlusUserSessionGrantCreateMySQL}
 	case providerPostgres:
-		queries = []string{queryPlusUserSessionCreatePostgreSQL, queryPlusUserSessionGrantCreatePostgreSQL, queryPlusUserSessionCreateIndexUsername, queryPlusUserSessionCreateIndexRevokedAt}
+		queries = []string{queryPlusUserSessionCreatePostgreSQL, queryPlusUserSessionGrantCreatePostgreSQL, queryPlusUserSessionCreateIndexUsername, queryPlusUserSessionCreateIndexRevokedAt, queryPlusUserSessionGrantCreateIndexRequestID}
 	default:
-		queries = []string{queryPlusUserSessionCreateSQLite, queryPlusUserSessionGrantCreateSQLite, queryPlusUserSessionCreateIndexUsername, queryPlusUserSessionCreateIndexRevokedAt}
+		queries = []string{queryPlusUserSessionCreateSQLite, queryPlusUserSessionGrantCreateSQLite, queryPlusUserSessionCreateIndexUsername, queryPlusUserSessionCreateIndexRevokedAt, queryPlusUserSessionGrantCreateIndexRequestID}
 	}
 
 	for _, query := range queries {

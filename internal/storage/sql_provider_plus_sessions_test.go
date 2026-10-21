@@ -585,6 +585,28 @@ func TestSQLProviderPlusUserSessionsPurgeWhileReplacing(t *testing.T) {
 	}
 }
 
+// The token endpoint looks a grant's record up by request ID on every token request, so request_id needs an index of
+// its own: the primary key is led by session_id.
+func TestSQLProviderPlusUserSessionsGrantRequestIDIndex(t *testing.T) {
+	queries := map[string]string{
+		providerSQLite:   `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'plus_user_session_grant' AND name = 'plus_user_session_grant_request_id';`,
+		providerMySQL:    `SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'plus_user_session_grant' AND index_name = 'plus_user_session_grant_request_id' AND column_name = 'request_id' AND seq_in_index = 1;`,
+		providerPostgres: `SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'plus_user_session_grant' AND indexname = 'plus_user_session_grant_request_id' AND indexdef LIKE '%(request_id)';`,
+	}
+
+	for name, provider := range newTestPlusProviders(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			require.NoError(t, provider.PlusUserSessionsSchemaEnsure(ctx))
+
+			var count int
+
+			require.NoError(t, provider.db.GetContext(ctx, &count, queries[name]))
+			assert.Equal(t, 1, count)
+		})
+	}
+}
+
 func TestSQLProviderPlusUserSessionsGrantCap(t *testing.T) {
 	for name, provider := range newTestPlusProviders(t) {
 		t.Run(name, func(t *testing.T) {

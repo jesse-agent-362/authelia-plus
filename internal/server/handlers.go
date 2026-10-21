@@ -298,6 +298,9 @@ func handlerMain(config *schema.Configuration, providers middlewares.Providers) 
 		WithPostMiddlewares(middlewares.RequireFullAuth).
 		Build()
 
+	// Revoking another session needs an elevated session so a stolen cookie can't lock the owner out. With
+	// identity_validation.elevated_session.skip_second_factor enabled, a 2FA cookie elevates without a one-time code,
+	// so a stolen one can revoke the owner's sessions again.
 	middlewareFullAuthElevated := middlewares.NewBridgeBuilder(*config, providers).
 		WithPreMiddlewares(middlewares.SecurityHeadersBase, middlewares.SecurityHeadersNoStore, middlewares.SecurityHeadersCSPNone).
 		WithPostMiddlewares(middlewares.RequireFullAuth, middlewares.RequireElevated).
